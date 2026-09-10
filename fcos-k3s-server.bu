@@ -1,0 +1,110 @@
+variant: fcos
+version: 1.5.0
+
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys:
+        - __SSH_PUBLIC_KEY_1__
+
+storage:
+  directories:
+    - path: /opt/k3s
+      mode: 0755
+
+  files:
+    - path: /etc/hostname
+      mode: 0644
+      contents:
+        inline: |
+          __HOSTNAME__
+
+    - path: /opt/k3s/install-k3s-server.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          set -euo pipefail
+
+          log() {
+            echo ""
+            echo "==> [k3s-bootstrap] $1"
+          }
+
+          # Idempotency guard - do nothing if already bootstrapped
+          if [ -f /etc/k3s-bootstrap-complete ]; then
+            log "Bootstrap already complete; skipping."
+            exit 0
+          fi
+
+          log "Starting k3s server bootstrap (joining existing HA cluster)"
+
+          log "Checking for open-vm-tools"
+          if ! rpm -q open-vm-tools &>/dev/null; then
+            log "Layering open-vm-tools via rpm-ostree (effective after reboot)"
+            rpm-ostree install -y open-vm-tools
+          else
+            log "open-vm-tools already present"
+          fi
+
+          log "Installing k3s server __K3S_VERSION__ (joining https://__CONTROL_PLANE_IP__:6443, tls-san=__NEW_SERVER_TLS_SAN__)"
+          curl -sfL https://get.k3s.io | \
+            INSTALL_K3S_VERSION="__K3S_VERSION__" \
+            INSTALL_K3S_EXEC="server \
+              --server https://__CONTROL_PLANE_IP__:6443 \
+              __TLS_SAN_FLAGS__ \
+              --write-kubeconfig-mode=644 \
+              --cluster-cidr=__CLUSTER_CIDR__ \
+              --service-cidr=__SERVICE_CIDR__ \
+              --token=__K3S_TOKEN__" \
+            sh -
+
+          log "Ensuring the k3s service is enabled and started"
+          systemctl enable --now k3s
+
+          log "Waiting for the k3s service to become active"
+          K3S_UP=false
+          for i in $(seq 1 30); do
+            if systemctl is-active --quiet k3s; then
+              log "k3s is active (after ~$((i * 2))s)"
+              K3S_UP=true
+              break
+            fi
+            echo "    still waiting on k3s... (${i}/30)"
+            sleep 2
+          done
+
+          if [ "${K3S_UP}" != true ]; then
+            log "ERROR: k3s did not become active after 60s. Last 50 journal lines:"
+            journalctl -u k3s --no-pager -n 50 || true
+            log "Not marking bootstrap complete or rebooting. Fix the issue above,"
+            log "then either re-run this service or reboot to retry: systemctl restart k3s-server-join.service"
+            exit 1
+          fi
+
+          log "Marking bootstrap complete"
+          touch /etc/k3s-bootstrap-complete
+
+          log "Bootstrap finished successfully; rebooting to finalize open-vm-tools layer"
+          systemctl reboot
+
+systemd:
+  units:
+    - name: k3s-server-join.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Bootstrap additional HA control-plane node (idempotent, one-time)
+        After=network-online.target
+        Wants=network-online.target
+        ConditionPathExists=!/etc/k3s-bootstrap-complete
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        StandardOutput=journal+console
+        StandardError=journal+console
+        ExecStart=/opt/k3s/install-k3s-server.sh
+
+        [Install]
+        WantedBy=multi-user.target

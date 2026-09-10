@@ -1,0 +1,375 @@
+# FCOS + k3s Deployment on VMware (govc)
+
+Scripts and Butane/Ignition templates for deploying a k3s Kubernetes cluster
+on Fedora CoreOS (FCOS) VMs, running on VMware ESXi/vSphere, driven entirely
+by `govc`.
+
+## What's in this repo
+
+```
+.
+├── fcos-k3s-controlplane.bu   Butane template for the control-plane node
+├── fcos-k3s-worker.bu         Butane template for worker nodes
+├── fcos-k3s-server.bu         Butane template for an additional HA control-plane node
+├── deploy-controlplane.sh     Deploys the control-plane VM
+├── deploy-worker.sh           Deploys a worker VM
+├── deploy-k3s-server.sh       Deploys an additional control-plane node into the HA cluster
+├── lib/
+│   └── common.sh              Shared functions used by all deploy scripts
+├── deploy.env.example         Template for your local secrets/config file
+├── gitignore.snippet          Lines to add to your .gitignore
+├── rendered/                  Generated per-host .bu/.ign files (gitignored)
+└── ova/                       Downloaded FCOS OVA cache (gitignored)
+```
+
+Only `deploy.env` (your real secrets), `rendered/` (generated output), and
+`ova/` (downloaded binary) are excluded from version control — everything
+else here is safe to commit.
+
+## How it works
+
+1. You run `deploy-controlplane.sh` or `deploy-worker.sh` with a hostname.
+2. The script resolves the FCOS OVA to use: if `FCOS_OVA` is unset in
+   `deploy.env`, it fetches the latest OVA for `FCOS_STREAM` (default
+   `stable`) from Fedora CoreOS's build metadata, verifies its sha256, and
+   caches it in `./ova/` (skipping re-download if already current). If
+   `FCOS_OVA` is set to a local path instead, that pinned file is used as-is.
+3. The script renders the matching `.bu` Butane template with real values
+   substituted in from `deploy.env`, then compiles it to Ignition JSON with
+   `butane`.
+4. `govc` imports the OVA into vSphere, places it on a datastore
+   selected automatically from a datastore cluster, maps its NIC to your
+   portgroup, and injects the Ignition config via `guestinfo`.
+5. The VM's MAC address is printed so you can add a DHCP reservation before
+   or after first boot.
+6. On first boot, Ignition writes SSH keys, hostname, and a one-shot systemd
+   unit that installs k3s (server or agent) and layers `open-vm-tools`
+   (absent from the base FCOS image). Once everything succeeds, the VM
+   reboots itself once to finalize the `open-vm-tools` layer.
+
+## Prerequisites
+
+- `govc` (VMware CLI), authenticated against your vCenter
+- `butane` (or the `quay.io/coreos/butane` container image)
+- `jq`
+- `curl` (used to fetch FCOS stream metadata and download the OVA, unless
+  you pin a local one via `FCOS_OVA`)
+- A vSphere datastore **cluster** (Storage DRS) — see note below if you use
+  a single datastore instead
+- An SSH keypair; you supply the public key, k3s uses a shared token you
+  choose yourself (no need to fetch a generated token off the control-plane)
+
+## Setup
+
+```bash
+cp deploy.env.example deploy.env
+```
+
+Edit `deploy.env` and fill in every value — see [Configuration
+reference](#configuration-reference) below. Then add the contents of
+`gitignore.snippet` to your repo's `.gitignore`:
+
+```bash
+cat gitignore.snippet >> .gitignore
+```
+
+Make the scripts executable if they aren't already:
+
+```bash
+chmod +x deploy-controlplane.sh deploy-worker.sh
+```
+
+## Usage
+
+Deploy the control-plane first — workers need it reachable to join:
+
+```bash
+./deploy-controlplane.sh k3s-cp1
+```
+
+Deploy one or more workers, giving each a unique hostname:
+
+```bash
+./deploy-worker.sh k3s-worker1
+./deploy-worker.sh k3s-worker2
+```
+
+### Waiting for a DHCP reservation
+
+The VM's MAC address is assigned when it's imported, before it's ever
+powered on. If you want to reserve `CONTROL_PLANE_IP` for the control-plane
+in your DHCP server *before* first boot (rather than relying on a second
+boot to pick it up), pass `--wait-for-reservation` (or `-w`):
+
+```bash
+./deploy-controlplane.sh k3s-cp1 --wait-for-reservation
+```
+
+The script prints the MAC address and pauses so you can add the reservation,
+then continues once you press Enter.
+
+Both scripts accept multiple flags together and in any order, e.g.
+`./deploy-controlplane.sh k3s-cp1 -w -c`.
+
+### High availability: `--cluster-init` and `--join`
+
+By default the control-plane uses k3s's built-in SQLite datastore, which
+is fine for a single control-plane node. For HA (multiple control-plane
+nodes), switch to the embedded etcd datastore:
+
+```bash
+# First control-plane node only - creates the HA cluster
+./deploy-controlplane.sh k3s-cp1 --cluster-init
+
+# Every additional control-plane node - joins the existing cluster
+./deploy-controlplane.sh k3s-cp2 --join
+./deploy-controlplane.sh k3s-cp3 --join
+```
+
+`--join` connects to `CONTROL_PLANE_IP` (the first node) via
+`--server https://<CONTROL_PLANE_IP>:6443`. `--cluster-init` and `--join`
+are mutually exclusive — the script errors if both are passed. Both flags
+are control-plane only; `deploy-worker.sh` rejects them.
+
+**The datastore choice is permanent, made once at cluster creation.**
+There's no live conversion from SQLite to etcd. If you already have a
+single-node SQLite cluster and want to switch to HA, you have to start
+over: redeploy the control-plane fresh with `--cluster-init`, and redeploy
+every worker too (a worker from the old cluster won't rejoin cleanly — the
+new cluster has a different CA/certs even if you reuse the same
+`K3S_TOKEN`). Deploying fresh VMs from Ignition rather than mutating
+existing ones is how this toolkit works everywhere else, so this isn't a
+special case.
+
+**`--cluster-init`/`--join` alone do not make the cluster's *endpoint*
+highly available**, only the etcd data. `CONTROL_PLANE_IP` is still a
+single node's address — if that specific node goes down, workers and
+`kubectl` lose access even though the other control-plane nodes and etcd
+data are fine. Genuine endpoint HA needs something in front of all
+control-plane nodes' IPs, e.g. `kube-vip` (a floating VIP among the
+control-plane nodes) or an external load balancer, with `CONTROL_PLANE_IP`
+and worker `K3S_URL`s pointing at that instead of any one node. Setting
+that up isn't automated by this toolkit.
+
+### Deploying an additional HA control-plane node
+
+`deploy-k3s-server.sh` deploys another control-plane node that joins the
+**existing** HA cluster at `CONTROL_PLANE_IP` — it's a companion to
+`deploy-controlplane.sh --join` covered above, with one difference: it
+lets you set a distinct `NEW_SERVER_TLS_SAN` per node (its own address,
+added to the cert alongside `CONTROL_PLANE_IP`) rather than always using
+`CONTROL_PLANE_IP` for every node's SAN. It reuses the same `K3S_TOKEN`
+and `CONTROL_PLANE_IP` as the rest of the cluster — this isn't a separate
+cluster identity:
+
+```bash
+./deploy-k3s-server.sh k3s-cp2
+```
+
+Like the others, it accepts `--wait-for-reservation`/`-w`. It does **not**
+accept `--cluster-init`/`--join` — joining the existing cluster is the only
+thing it does, so those flags don't apply. This only works if the cluster
+at `CONTROL_PLANE_IP` was created with `--cluster-init` (embedded etcd);
+see [High availability](#high-availability---cluster-init-and---join)
+above if it wasn't.
+
+Both `NEW_SERVER_TLS_SAN` here and `EXTRA_TLS_SAN` on the control-plane
+accept a comma-separated list, e.g. `NEW_SERVER_TLS_SAN='192.168.60.21,k3s-cp2.roach.lan'`
+to cover both an IP and a hostname on the same node's certificate.
+
+### What you'll see
+
+Each script prints numbered progress steps as it works through resolving
+the FCOS OVA, loading config, rendering Ignition, selecting a datastore,
+importing the OVA, resolving the MAC address, and powering on — e.g.:
+
+```
+==> [1/9] Loading configuration from deploy.env
+==> [2/9] Validating required variables
+==> [3/9] Resolving latest Fedora CoreOS OVA (stream: stable)
+==> [4/9] Rendering Butane template and compiling to Ignition
+==> [5/9] Selecting a datastore from cluster 'sata_datastores'
+==> [6/9] Building import spec (thin-provisioned disks, network mapped to 'VM Network')
+==> [7/9] Importing OVA as 'k3s-cp1' (this may take a few minutes)
+==> [8/9] Resolving VM MAC address for DHCP reservation
+==> [9/9] Injecting Ignition config and powering on
+```
+
+### After deployment
+
+Once the control-plane finishes bootstrapping and reboots:
+
+```bash
+ssh core@<CONTROL_PLANE_IP>
+sudo cat /etc/rancher/k3s/k3s.yaml   # kubeconfig
+```
+
+Note the `server:` line here will always read `https://127.0.0.1:6443` —
+k3s regenerates this file (tied to the local admin certificate) every time
+the service starts, so there's no point patching it on the VM; it would
+just get reset back on the next restart or reboot. Fix the address in your
+**local copy** instead, once, when you pull it off the VM:
+
+```bash
+scp core@<CONTROL_PLANE_IP>:/etc/rancher/k3s/k3s.yaml ./kubeconfig
+sed -i '' "s#https://127.0.0.1:6443#https://<CONTROL_PLANE_IP>:6443#" ./kubeconfig   # macOS/BSD sed
+# sed -i "s#https://127.0.0.1:6443#https://<CONTROL_PLANE_IP>:6443#" ./kubeconfig   # GNU sed (Linux)
+export KUBECONFIG=./kubeconfig
+kubectl get nodes
+```
+
+Each node's hostname is set to `<vm-name>.<DOMAIN_SUFFIX>` (from
+`deploy.env`), e.g. deploying `k3s-cp1` with `DOMAIN_SUFFIX=cluster.local`
+gives it the hostname `k3s-cp1.cluster.local`.
+
+## Configuration reference
+
+All variables live in `deploy.env` (copy from `deploy.env.example`).
+
+| Variable | Description |
+|---|---|
+| `GOVC_URL` | vCenter hostname/FQDN |
+| `GOVC_USERNAME` | vCenter username |
+| `GOVC_PASSWORD` | vCenter password |
+| `GOVC_INSECURE` | `true` to skip TLS cert validation |
+| `DS_CLUSTER` | Name of the datastore cluster (StoragePod) to deploy into |
+| `NETWORK` | Portgroup name to attach the VM's NIC to |
+| `FCOS_STREAM` | Fedora CoreOS release stream to auto-download the latest OVA from (`stable`, `testing`, or `next`). Ignored if `FCOS_OVA` is set. |
+| `FCOS_OVA` | Optional. Leave blank to auto-download the latest OVA for `FCOS_STREAM` into `./ova`. Set to a local file path to pin a specific OVA instead. |
+| `VM_FOLDER` | Full vCenter inventory path of the VM folder to import into, e.g. `/Datacenter/vm/k3s` |
+| `DOMAIN_SUFFIX` | Domain suffix appended to each VM's hostname |
+| `SSH_PUBLIC_KEY_1` | Your SSH public key, added to the `core` user |
+| `K3S_TOKEN` | Shared secret used for both server and agent join — pick your own value |
+| `CONTROL_PLANE_IP` | Control-plane's intended IP (used in k3s's TLS SAN and for workers to join) |
+| `EXTRA_TLS_SAN` | Optional. Comma-separated extra TLS SAN entries beyond `CONTROL_PLANE_IP`, e.g. a FQDN |
+| `K3S_VERSION` | k3s release tag, e.g. `v1.30.4+k3s1` |
+| `CLUSTER_CIDR` | Pod network CIDR (control-plane only) |
+| `SERVICE_CIDR` | Service network CIDR (control-plane only) |
+| `NEW_SERVER_TLS_SAN` | `deploy-k3s-server.sh` only. This joining node's own TLS SAN(s) - comma-separated for multiple values |
+
+## Design notes / gotchas
+
+A few non-obvious things this toolkit works around, documented here so
+they don't get "fixed" back into bugs later:
+
+- **Bootstrap logging is routed to the VM console**, not just the journal.
+  The `k3s-server-install.service` / `k3s-agent-install.service` units set
+  `StandardOutput=journal+console` and `StandardError=journal+console`, and
+  the install scripts print `==> [k3s-bootstrap] ...` checkpoints at each
+  phase (open-vm-tools, k3s install, service wait, completion, reboot).
+  Deliberately not using `set -x` for this — full shell tracing would print
+  the `curl` command containing `K3S_TOKEN` in plaintext to the console,
+  visible to anyone with vCenter console access.
+- **The k3s service is explicitly enabled and started**
+  (`systemctl enable --now k3s` / `k3s-agent`) rather than relying on the
+  `get.k3s.io` installer to have done so — in testing, the installer
+  completing successfully didn't guarantee the service was actually
+  started, which left the wait loop timing out with nothing obviously
+  wrong in the install step itself.
+- **Bootstrap fails loudly, on purpose, if k3s doesn't come up.** If the
+  wait loop times out, the script prints the last 50 journal lines for
+  `k3s`/`k3s-agent` and exits without marking bootstrap complete or
+  rebooting — so a real failure leaves the VM up for live debugging
+  instead of silently rebooting into the same broken state.
+- **The kubeconfig on the VM always shows `server: https://127.0.0.1:6443`,
+  and that's intentional — don't try to patch it there.** An earlier
+  version of this toolkit patched `/etc/rancher/k3s/k3s.yaml` in place
+  during bootstrap to point at `CONTROL_PLANE_IP`. That was removed: k3s
+  regenerates this file (it's tied to the local admin certificate) every
+  time the service starts, so any in-place patch gets silently reverted on
+  the next restart or reboot. Fix the address once, in your local copy,
+  after pulling it off the VM — see [After deployment](#after-deployment).
+  This applies equally to `deploy-k3s-server.sh`'s additional nodes.
+- **The control-plane doesn't pin `--node-ip`/`--advertise-address`.** As
+  a separate precaution, since IP assignment here is DHCP-reservation-based
+  rather than static, the VM's actual address on a given boot might not
+  yet match `CONTROL_PLANE_IP` (e.g. before a reservation has taken
+  effect), and pinning those flags to an address the host doesn't actually
+  hold would make k3s fail to bind. Only `--tls-san=CONTROL_PLANE_IP` is
+  set, so the certificate stays valid for that address once DHCP actually
+  assigns it; k3s auto-detects the bind address itself.
+- **The FCOS OVA is resolved dynamically**, not hardcoded to a filename
+  that goes stale. `ensure_fcos_ova` in `lib/common.sh` reads Fedora
+  CoreOS's published stream metadata
+  (`https://builds.coreos.fedoraproject.org/streams/<stream>.json`),
+  extracts the current OVA URL and sha256 for `x86_64`, and downloads only
+  if the cached copy in `./ova/` is missing or its checksum doesn't match.
+  Set `FCOS_OVA` in `deploy.env` to a local file path if you need to pin a
+  specific, reproducible version instead of always deploying the latest.
+- **Networking is DHCP-based**, not static. `CONTROL_PLANE_IP` is the
+  address k3s puts in its TLS certificate SAN and that workers use to join —
+  getting the VM's actual interface to have that address is up to your DHCP
+  server (via a MAC reservation), not Ignition/NetworkManager.
+- **Butane placeholders are sentinel-wrapped** (`__LIKE_THIS__`) rather than
+  bare (`LIKE_THIS`). A bare placeholder can collide with substrings of real
+  variable names during `sed` substitution — e.g. a bare `K3S_VERSION`
+  placeholder matches inside `INSTALL_K3S_VERSION`, corrupting it.
+- **`--cluster-init`/`--join` are threaded through as a sentinel
+  placeholder**, same as every other Butane substitution:
+  `deploy-controlplane.sh` resolves the chosen mode to one of
+  `--cluster-init`, `--server https://<CONTROL_PLANE_IP>:6443`, or an
+  empty string, and substitutes `__CP_EXTRA_FLAG__` in the k3s server exec
+  args accordingly — the Butane template itself never branches on mode.
+  `deploy-worker.sh` shares the same `parse_args` (it has to accept both
+  flags to reject them with a clear error) but never uses either value.
+- **TLS SAN accepts multiple values via a comma-separated `deploy.env`
+  variable.** k3s supports repeating `--tls-san` per value, so
+  `build_tls_san_flags` in `lib/common.sh` splits a comma-separated string
+  (trimming whitespace around each entry) into the repeated flags — one
+  variable in `deploy.env` can hold e.g. both an IP and a FQDN. Used for
+  `EXTRA_TLS_SAN` (control-plane, additive to `CONTROL_PLANE_IP`) and
+  `NEW_SERVER_TLS_SAN` (`deploy-k3s-server.sh`, the whole value).
+- **Disks are thin-provisioned.** `build_import_options` in
+  `lib/common.sh` sets `DiskProvisioning: "thin"` in the same `-options`
+  spec used for network mapping — `govc import.ova` has no standalone flag
+  for this either, same as networking.
+- **`govc import.ova` has no `-network` flag.** Network mapping only works
+  via an `-options` JSON spec with a `NetworkMapping` array (built from
+  `govc import.spec` and edited with `jq`); the scripts do this
+  automatically.
+- **Datastore cluster members aren't listed by `govc find -parent`.**
+  `govc ls <StoragePod path>` is the reliable way to enumerate them; this is
+  what `select_datastore` in `lib/common.sh` uses.
+- **`open-vm-tools` isn't on the base FCOS image.** It's layered via
+  `rpm-ostree install` during bootstrap and only takes effect after a
+  reboot — which is why the bootstrap script ends with `systemctl reboot`,
+  reached only if every prior step succeeded (`set -euo pipefail`).
+- **The k3s token is a plain shared secret**, not the auto-generated
+  `K10<hash>::server:<secret>` token k3s would otherwise write to
+  `/var/lib/rancher/k3s/server/node-token`. This skips a manual
+  fetch-token-then-configure-agent step, at the cost of TLS
+  trust-on-first-use instead of hash-verified join. Fine for a trusted
+  private subnet; reconsider if that's not your environment.
+
+## Troubleshooting
+
+- **"Could not resolve a datastore from cluster ..."** — confirm
+  `govc ls <StoragePod path>` (resolved via `govc find / -type StoragePod
+  -name "${DS_CLUSTER}"`) actually returns datastore paths.
+- **"Checksum mismatch after download!"** — the OVA download was
+  interrupted or corrupted; re-run the script (it retries automatically
+  since the partial file is never kept as the final `.ova`). If it persists,
+  check connectivity to `builds.coreos.fedoraproject.org`.
+- **Control-plane IP not what you expect after boot** — check that DHCP
+  actually reserved `CONTROL_PLANE_IP` for the printed MAC address; nothing
+  in Ignition configures a static IP.
+- **Kubeconfig on the VM shows `127.0.0.1` instead of `CONTROL_PLANE_IP`**
+  — this is expected, not a bug; k3s regenerates that file on every service
+  start. See [After deployment](#after-deployment) for pulling a working
+  copy locally instead of expecting the VM's own file to be pre-patched.
+- **"k3s did not become active" / the VM never reboots after deploy** — the
+  bootstrap script exits (without rebooting) and prints the last 50
+  journal lines for `k3s`/`k3s-agent` on the console when this happens.
+  Current templates explicitly run `systemctl enable --now k3s` (or
+  `k3s-agent`) after install rather than assuming the installer started it,
+  which was the cause of this in testing. If you still hit it, check the
+  printed journal output for the actual failure and re-run the unit with
+  `systemctl restart k3s-server-install.service` (or
+  `k3s-agent-install.service` on a worker) once resolved.
+- **`jq` not found** — required for datastore selection and import-spec
+  building; install via your package manager (`dnf install jq` /
+  `apt install jq`).
+- **Not seeing bootstrap output on the console** — open the VM's console
+  in vCenter before or immediately after power-on; bootstrap runs early in
+  boot and finishes with an automatic reboot, so opening the console late
+  can mean missing most or all of the log output.
