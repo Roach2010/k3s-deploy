@@ -70,7 +70,7 @@ REQUIRED_VARS=(
   GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
   DS_CLUSTER NETWORK VM_FOLDER DOMAIN_SUFFIX
   SSH_PUBLIC_KEY_1 K3S_TOKEN CONTROL_PLANE_IP K3S_VERSION
-  CLUSTER_CIDR SERVICE_CIDR
+  CLUSTER_CIDR SERVICE_CIDR KUBE_API_HOSTNAME
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
@@ -156,10 +156,12 @@ else
   CP_MODE="single-node (sqlite)"
 fi
 
-# Expand a comma-separated SAN list (CONTROL_PLANE_IP plus optional
-# EXTRA_TLS_SAN) into repeated --tls-san=... flags, trimming whitespace
-# around each entry. k3s supports --tls-san multiple times.
-SAN_CSV="${CONTROL_PLANE_IP}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
+# Expand a comma-separated SAN list (CONTROL_PLANE_IP, KUBE_API_HOSTNAME,
+# plus optional EXTRA_TLS_SAN) into repeated --tls-san=... flags, trimming
+# whitespace around each entry. k3s supports --tls-san multiple times.
+# KUBE_API_HOSTNAME is included automatically - the core user's kubeconfig
+# points at it, and TLS validation would fail if it weren't on the cert.
+SAN_CSV="${CONTROL_PLANE_IP},${KUBE_API_HOSTNAME}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
 TLS_SAN_FLAGS=""
 IFS=',' read -ra SAN_VALUES <<< "${SAN_CSV}"
 for san in "${SAN_VALUES[@]}"; do
@@ -180,6 +182,7 @@ sed \
   -e "s|__TLS_SAN_FLAGS__|${TLS_SAN_FLAGS}|g" \
   -e "s|__CP_EXTRA_FLAG__|${CP_EXTRA_FLAG}|g" \
   -e "s|__CP_MODE__|${CP_MODE}|g" \
+  -e "s|__KUBE_API_HOSTNAME__|${KUBE_API_HOSTNAME}|g" \
   "${SCRIPT_DIR}/fcos-k3s-controlplane.bu" > "${OUT_DIR}/${VM_NAME}.bu"
 
 butane --pretty --strict "${OUT_DIR}/${VM_NAME}.bu" > "${OUT_DIR}/${VM_NAME}.ign"

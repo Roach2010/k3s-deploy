@@ -12,12 +12,24 @@ storage:
     - path: /opt/k3s
       mode: 0755
 
+    - path: /etc/rancher/k3s
+      mode: 0755
+
   files:
     - path: /etc/hostname
       mode: 0644
       contents:
         inline: |
           __HOSTNAME__
+
+    - path: /etc/rancher/k3s/token
+      mode: 0600
+      user:
+        name: root
+      group:
+        name: root
+      contents:
+        inline: __K3S_TOKEN__
 
     - path: /opt/k3s/install-agent.sh
       mode: 0755
@@ -50,8 +62,7 @@ storage:
           curl -sfL https://get.k3s.io | \
             INSTALL_K3S_VERSION="__K3S_VERSION__" \
             K3S_URL="https://__CONTROL_PLANE_IP__:6443" \
-            K3S_TOKEN="__K3S_TOKEN__" \
-            INSTALL_K3S_EXEC="agent" \
+            INSTALL_K3S_EXEC="agent --token-file=/etc/rancher/k3s/token" \
             sh -
 
           log "Ensuring the k3s-agent service is enabled and started"

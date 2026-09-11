@@ -172,26 +172,33 @@ importing the OVA, resolving the MAC address, and powering on — e.g.:
 
 ### After deployment
 
-Once the control-plane finishes bootstrapping and reboots:
+Once the control-plane finishes bootstrapping and reboots, a ready-to-use
+kubeconfig is already waiting at `/home/core/.kube/config`, owned by
+`core` (no `sudo` needed) and pointed at `https://<KUBE_API_HOSTNAME>:6443`:
 
 ```bash
 ssh core@<CONTROL_PLANE_IP>
-sudo cat /etc/rancher/k3s/k3s.yaml   # kubeconfig
+kubectl get nodes
 ```
 
-Note the `server:` line here will always read `https://127.0.0.1:6443` —
-k3s regenerates this file (tied to the local admin certificate) every time
-the service starts, so there's no point patching it on the VM; it would
-just get reset back on the next restart or reboot. Fix the address in your
-**local copy** instead, once, when you pull it off the VM:
+This works out of the box **only if `KUBE_API_HOSTNAME` actually resolves**
+to `CONTROL_PLANE_IP` — via your own DNS server or an `/etc/hosts` entry.
+Nothing in this toolkit sets that up.
+
+Pull it to your workstation the same way, no manual editing required:
 
 ```bash
-scp core@<CONTROL_PLANE_IP>:/etc/rancher/k3s/k3s.yaml ./kubeconfig
-sed -i '' "s#https://127.0.0.1:6443#https://<CONTROL_PLANE_IP>:6443#" ./kubeconfig   # macOS/BSD sed
-# sed -i "s#https://127.0.0.1:6443#https://<CONTROL_PLANE_IP>:6443#" ./kubeconfig   # GNU sed (Linux)
+scp core@<CONTROL_PLANE_IP>:.kube/config ./kubeconfig
 export KUBECONFIG=./kubeconfig
 kubectl get nodes
 ```
+
+The system-level file at `/etc/rancher/k3s/k3s.yaml` still always shows
+`server: https://127.0.0.1:6443` — that one's k3s's own admin config, gets
+regenerated on every service start, and is deliberately left untouched;
+see the design note below on why. `/home/core/.kube/config` is a separate,
+one-time copy that k3s never touches again, which is what makes patching
+it safe.
 
 Each node's hostname is set to `<vm-name>.<DOMAIN_SUFFIX>` (from
 `deploy.env`), e.g. deploying `k3s-cp1` with `DOMAIN_SUFFIX=cluster.local`
@@ -216,6 +223,7 @@ All variables live in `deploy.env` (copy from `deploy.env.example`).
 | `SSH_PUBLIC_KEY_1` | Your SSH public key, added to the `core` user |
 | `K3S_TOKEN` | Shared secret used for both server and agent join — pick your own value |
 | `CONTROL_PLANE_IP` | Control-plane's intended IP (used in k3s's TLS SAN and for workers to join) |
+| `KUBE_API_HOSTNAME` | Hostname for the core user's kubeconfig `server:` line; auto-added to TLS SAN |
 | `EXTRA_TLS_SAN` | Optional. Comma-separated extra TLS SAN entries beyond `CONTROL_PLANE_IP`, e.g. a FQDN |
 | `K3S_VERSION` | k3s release tag, e.g. `v1.30.4+k3s1` |
 | `CLUSTER_CIDR` | Pod network CIDR (control-plane only) |
@@ -245,15 +253,22 @@ they don't get "fixed" back into bugs later:
   `k3s`/`k3s-agent` and exits without marking bootstrap complete or
   rebooting — so a real failure leaves the VM up for live debugging
   instead of silently rebooting into the same broken state.
-- **The kubeconfig on the VM always shows `server: https://127.0.0.1:6443`,
-  and that's intentional — don't try to patch it there.** An earlier
-  version of this toolkit patched `/etc/rancher/k3s/k3s.yaml` in place
-  during bootstrap to point at `CONTROL_PLANE_IP`. That was removed: k3s
-  regenerates this file (it's tied to the local admin certificate) every
-  time the service starts, so any in-place patch gets silently reverted on
-  the next restart or reboot. Fix the address once, in your local copy,
-  after pulling it off the VM — see [After deployment](#after-deployment).
-  This applies equally to any additional `--join`ed control-plane node.
+- **`/etc/rancher/k3s/k3s.yaml` always shows `server: https://127.0.0.1:6443`
+  — leave it alone, don't patch it in place.** k3s regenerates this file
+  (it's tied to the local admin certificate) every time the service
+  starts, so an in-place patch gets silently reverted on the next restart
+  or reboot. Instead, the bootstrap script makes a **one-time copy** to
+  `/home/core/.kube/config` with `server:` rewritten to
+  `KUBE_API_HOSTNAME` — that copy is never touched by k3s again, which is
+  what makes patching it safe. This applies to any additional `--join`ed
+  control-plane node too; each gets its own copy pointed at the same
+  `KUBE_API_HOSTNAME`.
+- **`KUBE_API_HOSTNAME` is automatically folded into the TLS SAN list**,
+  alongside `CONTROL_PLANE_IP` and any `EXTRA_TLS_SAN` entries. Without
+  this, `kubectl` using the generated `/home/core/.kube/config` would fail
+  TLS certificate validation — the hostname in `server:` has to be present
+  on the cert regardless of network path, and nothing else in this toolkit
+  would otherwise put it there.
 - **The control-plane doesn't pin `--node-ip`/`--advertise-address`.** As
   a separate precaution, since IP assignment here is DHCP-reservation-based
   rather than static, the VM's actual address on a given boot might not
@@ -312,9 +327,21 @@ they don't get "fixed" back into bugs later:
   fetch-token-then-configure-agent step, at the cost of TLS
   trust-on-first-use instead of hash-verified join. Fine for a trusted
   private subnet; reconsider if that's not your environment.
+- **The token is delivered as a file, not a CLI argument.** Ignition
+  writes it to `/etc/rancher/k3s/token` (`root:root`, mode `0600`), and
+  both `k3s server` and `k3s agent` are started with
+  `--token-file=/etc/rancher/k3s/token` instead of `--token=<value>`.
+  A token passed via `--token` sits in the running process's command
+  line for as long as the service runs, visible to anyone with shell
+  access via `ps aux`; a restrictive file avoids that exposure.
 
 ## Troubleshooting
 
+- **`kubectl` fails to connect using `/home/core/.kube/config`** — check
+  that `KUBE_API_HOSTNAME` actually resolves to `CONTROL_PLANE_IP` from
+  wherever you're running `kubectl` (`getent hosts <hostname>` or
+  `nslookup`). This toolkit only puts the hostname in the kubeconfig and
+  the certificate's SAN list; DNS/`/etc/hosts` resolution is on you.
 - **"Could not resolve a datastore from cluster ..."** — confirm
   `govc ls <StoragePod path>` (resolved via `govc find / -type StoragePod
   -name "${DS_CLUSTER}"`) actually returns datastore paths.
