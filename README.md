@@ -10,17 +10,19 @@ by `govc`.
 .
 ├── fcos-k3s-controlplane.bu   Butane template for the control-plane node
 ├── fcos-k3s-worker.bu         Butane template for worker nodes
-├── fcos-k3s-server.bu         Butane template for an additional HA control-plane node
-├── deploy-controlplane.sh     Deploys the control-plane VM
-├── deploy-worker.sh           Deploys a worker VM
-├── deploy-k3s-server.sh       Deploys an additional control-plane node into the HA cluster
-├── lib/
-│   └── common.sh              Shared functions used by all deploy scripts
+├── deploy-controlplane.sh     Deploys the control-plane VM (self-contained)
+├── deploy-worker.sh           Deploys a worker VM (self-contained)
 ├── deploy.env.example         Template for your local secrets/config file
-├── gitignore.snippet          Lines to add to your .gitignore
+├── .gitignore                 Excludes deploy.env, rendered/, and ova/
 ├── rendered/                  Generated per-host .bu/.ign files (gitignored)
 └── ova/                       Downloaded FCOS OVA cache (gitignored)
 ```
+
+Each deploy script is fully self-contained — no shared library file to
+jump to. There's duplication across the three (each has its own copy of
+the datastore-selection, OVA-download, and import logic), which is a
+deliberate trade-off for being able to read one script top-to-bottom
+without cross-referencing another file.
 
 Only `deploy.env` (your real secrets), `rendered/` (generated output), and
 `ova/` (downloaded binary) are excluded from version control — everything
@@ -66,12 +68,8 @@ cp deploy.env.example deploy.env
 ```
 
 Edit `deploy.env` and fill in every value — see [Configuration
-reference](#configuration-reference) below. Then add the contents of
-`gitignore.snippet` to your repo's `.gitignore`:
-
-```bash
-cat gitignore.snippet >> .gitignore
-```
+reference](#configuration-reference) below. `.gitignore` is already set up
+to exclude `deploy.env`, `rendered/`, and `ova/`.
 
 Make the scripts executable if they aren't already:
 
@@ -151,31 +149,8 @@ control-plane nodes) or an external load balancer, with `CONTROL_PLANE_IP`
 and worker `K3S_URL`s pointing at that instead of any one node. Setting
 that up isn't automated by this toolkit.
 
-### Deploying an additional HA control-plane node
-
-`deploy-k3s-server.sh` deploys another control-plane node that joins the
-**existing** HA cluster at `CONTROL_PLANE_IP` — it's a companion to
-`deploy-controlplane.sh --join` covered above, with one difference: it
-lets you set a distinct `NEW_SERVER_TLS_SAN` per node (its own address,
-added to the cert alongside `CONTROL_PLANE_IP`) rather than always using
-`CONTROL_PLANE_IP` for every node's SAN. It reuses the same `K3S_TOKEN`
-and `CONTROL_PLANE_IP` as the rest of the cluster — this isn't a separate
-cluster identity:
-
-```bash
-./deploy-k3s-server.sh k3s-cp2
-```
-
-Like the others, it accepts `--wait-for-reservation`/`-w`. It does **not**
-accept `--cluster-init`/`--join` — joining the existing cluster is the only
-thing it does, so those flags don't apply. This only works if the cluster
-at `CONTROL_PLANE_IP` was created with `--cluster-init` (embedded etcd);
-see [High availability](#high-availability---cluster-init-and---join)
-above if it wasn't.
-
-Both `NEW_SERVER_TLS_SAN` here and `EXTRA_TLS_SAN` on the control-plane
-accept a comma-separated list, e.g. `NEW_SERVER_TLS_SAN='192.168.60.21,k3s-cp2.roach.lan'`
-to cover both an IP and a hostname on the same node's certificate.
+`EXTRA_TLS_SAN` accepts a comma-separated list if you want more than one
+extra entry on the certificate, e.g. `EXTRA_TLS_SAN='k3s.roach.lan,k3s-cp2.roach.lan'`.
 
 ### What you'll see
 
@@ -245,7 +220,6 @@ All variables live in `deploy.env` (copy from `deploy.env.example`).
 | `K3S_VERSION` | k3s release tag, e.g. `v1.30.4+k3s1` |
 | `CLUSTER_CIDR` | Pod network CIDR (control-plane only) |
 | `SERVICE_CIDR` | Service network CIDR (control-plane only) |
-| `NEW_SERVER_TLS_SAN` | `deploy-k3s-server.sh` only. This joining node's own TLS SAN(s) - comma-separated for multiple values |
 
 ## Design notes / gotchas
 
@@ -279,7 +253,7 @@ they don't get "fixed" back into bugs later:
   time the service starts, so any in-place patch gets silently reverted on
   the next restart or reboot. Fix the address once, in your local copy,
   after pulling it off the VM — see [After deployment](#after-deployment).
-  This applies equally to `deploy-k3s-server.sh`'s additional nodes.
+  This applies equally to any additional `--join`ed control-plane node.
 - **The control-plane doesn't pin `--node-ip`/`--advertise-address`.** As
   a separate precaution, since IP assignment here is DHCP-reservation-based
   rather than static, the VM's actual address on a given boot might not
@@ -289,9 +263,8 @@ they don't get "fixed" back into bugs later:
   set, so the certificate stays valid for that address once DHCP actually
   assigns it; k3s auto-detects the bind address itself.
 - **The FCOS OVA is resolved dynamically**, not hardcoded to a filename
-  that goes stale. `ensure_fcos_ova` in `lib/common.sh` reads Fedora
-  CoreOS's published stream metadata
-  (`https://builds.coreos.fedoraproject.org/streams/<stream>.json`),
+  that goes stale. Each script reads Fedora CoreOS's published stream
+  metadata (`https://builds.coreos.fedoraproject.org/streams/<stream>.json`),
   extracts the current OVA URL and sha256 for `x86_64`, and downloads only
   if the cached copy in `./ova/` is missing or its checksum doesn't match.
   Set `FCOS_OVA` in `deploy.env` to a local file path if you need to pin a
@@ -304,32 +277,31 @@ they don't get "fixed" back into bugs later:
   bare (`LIKE_THIS`). A bare placeholder can collide with substrings of real
   variable names during `sed` substitution — e.g. a bare `K3S_VERSION`
   placeholder matches inside `INSTALL_K3S_VERSION`, corrupting it.
-- **`--cluster-init`/`--join` are threaded through as a sentinel
-  placeholder**, same as every other Butane substitution:
-  `deploy-controlplane.sh` resolves the chosen mode to one of
+- **`--cluster-init`/`--join` resolve to a plain string**, substituted
+  into the Butane template the same way every other value is:
+  `deploy-controlplane.sh` computes `CP_EXTRA_FLAG` as one of
   `--cluster-init`, `--server https://<CONTROL_PLANE_IP>:6443`, or an
-  empty string, and substitutes `__CP_EXTRA_FLAG__` in the k3s server exec
-  args accordingly — the Butane template itself never branches on mode.
-  `deploy-worker.sh` shares the same `parse_args` (it has to accept both
-  flags to reject them with a clear error) but never uses either value.
+  empty string, based on which flag was passed — the Butane template
+  itself never branches on mode. `deploy-worker.sh` parses (and rejects)
+  `--cluster-init`/`--join` too, since there's no shared arg-parsing code
+  to reuse.
 - **TLS SAN accepts multiple values via a comma-separated `deploy.env`
-  variable.** k3s supports repeating `--tls-san` per value, so
-  `build_tls_san_flags` in `lib/common.sh` splits a comma-separated string
-  (trimming whitespace around each entry) into the repeated flags — one
-  variable in `deploy.env` can hold e.g. both an IP and a FQDN. Used for
-  `EXTRA_TLS_SAN` (control-plane, additive to `CONTROL_PLANE_IP`) and
-  `NEW_SERVER_TLS_SAN` (`deploy-k3s-server.sh`, the whole value).
-- **Disks are thin-provisioned.** `build_import_options` in
-  `lib/common.sh` sets `DiskProvisioning: "thin"` in the same `-options`
-  spec used for network mapping — `govc import.ova` has no standalone flag
-  for this either, same as networking.
+  variable.** k3s supports repeating `--tls-san` per value, so each script
+  splits a comma-separated string (trimming whitespace around each entry)
+  into the repeated flags — one variable in `deploy.env` can hold e.g.
+  both an IP and a FQDN. Used for `EXTRA_TLS_SAN`, additive to
+  `CONTROL_PLANE_IP`.
+- **Disks are thin-provisioned.** Each script sets
+  `DiskProvisioning: "thin"` in the same `-options` spec used for network
+  mapping — `govc import.ova` has no standalone flag for this either,
+  same as networking.
 - **`govc import.ova` has no `-network` flag.** Network mapping only works
   via an `-options` JSON spec with a `NetworkMapping` array (built from
   `govc import.spec` and edited with `jq`); the scripts do this
   automatically.
 - **Datastore cluster members aren't listed by `govc find -parent`.**
-  `govc ls <StoragePod path>` is the reliable way to enumerate them; this is
-  what `select_datastore` in `lib/common.sh` uses.
+  `govc ls <StoragePod path>` is the reliable way to enumerate them; this
+  is what each script's datastore-selection step uses.
 - **`open-vm-tools` isn't on the base FCOS image.** It's layered via
   `rpm-ostree install` during bootstrap and only takes effect after a
   reboot — which is why the bootstrap script ends with `systemctl reboot`,
