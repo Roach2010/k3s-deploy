@@ -71,6 +71,7 @@ REQUIRED_VARS=(
   DS_CLUSTER NETWORK VM_FOLDER DOMAIN_SUFFIX
   SSH_PUBLIC_KEY_1 K3S_TOKEN CONTROL_PLANE_IP K3S_VERSION
   CLUSTER_CIDR SERVICE_CIDR KUBE_API_HOSTNAME
+  CP1_DNS_NAME CP2_IP CP2_DNS_NAME CP3_IP CP3_DNS_NAME
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
@@ -156,12 +157,13 @@ else
   CP_MODE="single-node (sqlite)"
 fi
 
-# Expand a comma-separated SAN list (CONTROL_PLANE_IP, KUBE_API_HOSTNAME,
-# plus optional EXTRA_TLS_SAN) into repeated --tls-san=... flags, trimming
-# whitespace around each entry. k3s supports --tls-san multiple times.
-# KUBE_API_HOSTNAME is included automatically - the core user's kubeconfig
-# points at it, and TLS validation would fail if it weren't on the cert.
-SAN_CSV="${CONTROL_PLANE_IP},${KUBE_API_HOSTNAME}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
+# Expand a comma-separated SAN list into repeated --tls-san=... flags,
+# trimming whitespace around each entry. k3s supports --tls-san multiple
+# times. Every control-plane node's cert gets the SAME full set - all
+# three CP IPs, all three CP DNS names, and the shared KUBE_API_HOSTNAME -
+# regardless of which node is currently being deployed, plus whatever
+# EXTRA_TLS_SAN adds on top.
+SAN_CSV="${CONTROL_PLANE_IP},${CP2_IP},${CP3_IP},${CP1_DNS_NAME},${CP2_DNS_NAME},${CP3_DNS_NAME},${KUBE_API_HOSTNAME}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
 TLS_SAN_FLAGS=""
 IFS=',' read -ra SAN_VALUES <<< "${SAN_CSV}"
 for san in "${SAN_VALUES[@]}"; do

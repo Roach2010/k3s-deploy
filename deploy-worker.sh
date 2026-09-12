@@ -58,7 +58,7 @@ step "Validating required variables"
 REQUIRED_VARS=(
   GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
   DS_CLUSTER NETWORK VM_FOLDER DOMAIN_SUFFIX
-  SSH_PUBLIC_KEY_1 K3S_TOKEN CONTROL_PLANE_IP K3S_VERSION
+  SSH_PUBLIC_KEY_1 K3S_TOKEN KUBE_API_HOSTNAME K3S_VERSION
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
@@ -138,7 +138,7 @@ sed \
   -e "s|__HOSTNAME__|${FQDN}|g" \
   -e "s|__SSH_PUBLIC_KEY_1__|${SSH_PUBLIC_KEY_1}|g" \
   -e "s|__K3S_TOKEN__|${K3S_TOKEN}|g" \
-  -e "s|__CONTROL_PLANE_IP__|${CONTROL_PLANE_IP}|g" \
+  -e "s|__KUBE_API_HOSTNAME__|${KUBE_API_HOSTNAME}|g" \
   -e "s|__K3S_VERSION__|${K3S_VERSION}|g" \
   "${SCRIPT_DIR}/fcos-k3s-worker.bu" > "${OUT_DIR}/${VM_NAME}.bu"
 
@@ -233,6 +233,6 @@ govc vm.power -on "${VM_NAME}"
 echo "Powered on."
 
 echo ""
-echo "Deployed ${VM_NAME}. It will join ${CONTROL_PLANE_IP} once k3s server is reachable."
+echo "Deployed ${VM_NAME}. It will join ${KUBE_API_HOSTNAME} once k3s server is reachable."
 echo "Note: the node reboots itself once to finalize the open-vm-tools layer,"
 echo "after k3s agent bootstrap has completed successfully."

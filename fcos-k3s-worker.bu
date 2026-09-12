@@ -58,10 +58,10 @@ storage:
             log "open-vm-tools already present"
           fi
 
-          log "Installing k3s agent __K3S_VERSION__, joining __CONTROL_PLANE_IP__"
+          log "Installing k3s agent __K3S_VERSION__, joining __KUBE_API_HOSTNAME__"
           curl -sfL https://get.k3s.io | \
             INSTALL_K3S_VERSION="__K3S_VERSION__" \
-            K3S_URL="https://__CONTROL_PLANE_IP__:6443" \
+            K3S_URL="https://__KUBE_API_HOSTNAME__:6443" \
             INSTALL_K3S_EXEC="agent --token-file=/etc/rancher/k3s/token" \
             sh -
 
