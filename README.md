@@ -113,11 +113,11 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `SSH_PUBLIC_KEY_1` | Your SSH public key (added to the `core` user on the node). |
 | `K3S_TOKEN` | A secret shared key you create for joining nodes to the cluster. |
 | `CP1_IP` | IP of control-plane node 1. Nodes 2 and 3 join it directly. |
-| `CP1_DNS_NAME` | DNS name for control-plane node 1. |
+| `CP1_NAME` | Hostname for control-plane node 1 (`DOMAIN_SUFFIX` is appended automatically). |
 | `CP2_IP` | IP of control-plane node 2. |
-| `CP2_DNS_NAME` | DNS name for control-plane node 2. |
+| `CP2_NAME` | Hostname for control-plane node 2. |
 | `CP3_IP` | IP of control-plane node 3. |
-| `CP3_DNS_NAME` | DNS name for control-plane node 3. |
+| `CP3_NAME` | Hostname for control-plane node 3. |
 | `KUBE_API_HOSTNAME` | Shared API DNS name (point three A records at it - see Step 2). |
 | `EXTRA_TLS_SAN` | *(Optional)* Extra IPs or hostnames to include in the API server TLS certificate. |
 | `K3S_VERSION` | Exact release tag of k3s (e.g., `v1.30.4+k3s1`). |
