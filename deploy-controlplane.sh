@@ -14,7 +14,7 @@ step() {
 
 # --- Argument parsing ----------------------------------------------------
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <hostname> [--wait-for-reservation|-w] [--cluster-init|-c] [--join|-j]"
+  echo "Usage: $0 <hostname> [--wait-for-reservation|-w] [--cluster-init|-c] [--join|-j] [--node|-n <1|2|3>]"
   exit 1
 fi
 VM_NAME=$1
@@ -23,6 +23,7 @@ shift
 WAIT_FOR_RESERVATION=false
 CLUSTER_INIT=false
 JOIN_CLUSTER=false
+NODE_NUMBER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wait-for-reservation|-w)
@@ -34,14 +35,27 @@ while [[ $# -gt 0 ]]; do
     --join|-j)
       JOIN_CLUSTER=true
       ;;
+    --node|-n)
+      shift
+      NODE_NUMBER="${1:-}"
+      ;;
     *)
       echo "Unknown argument: $1"
-      echo "Usage: $0 <hostname> [--wait-for-reservation|-w] [--cluster-init|-c] [--join|-j]"
+      echo "Usage: $0 <hostname> [--wait-for-reservation|-w] [--cluster-init|-c] [--join|-j] [--node|-n <1|2|3>]"
       exit 1
       ;;
   esac
   shift
 done
+
+case "${NODE_NUMBER}" in
+  ""|1|2|3)
+    ;;
+  *)
+    echo "Invalid --node/-n value: '${NODE_NUMBER}' (must be 1, 2, or 3)"
+    exit 1
+    ;;
+esac
 
 if [[ "${CLUSTER_INIT}" == true && "${JOIN_CLUSTER}" == true ]]; then
   echo "--cluster-init/-c and --join/-j are mutually exclusive."
@@ -69,9 +83,9 @@ step "Validating required variables"
 REQUIRED_VARS=(
   GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
   DS_CLUSTER NETWORK VM_FOLDER DOMAIN_SUFFIX
-  SSH_PUBLIC_KEY_1 K3S_TOKEN CONTROL_PLANE_IP K3S_VERSION
+  SSH_PUBLIC_KEY_1 K3S_TOKEN K3S_VERSION
   CLUSTER_CIDR SERVICE_CIDR KUBE_API_HOSTNAME
-  CP1_DNS_NAME CP2_IP CP2_DNS_NAME CP3_IP CP3_DNS_NAME
+  CP1_IP CP1_DNS_NAME CP2_IP CP2_DNS_NAME CP3_IP CP3_DNS_NAME
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
@@ -150,7 +164,7 @@ if [[ "${CLUSTER_INIT}" == true ]]; then
   CP_EXTRA_FLAG="--cluster-init"
   CP_MODE="cluster-init (new HA cluster)"
 elif [[ "${JOIN_CLUSTER}" == true ]]; then
-  CP_EXTRA_FLAG="--server https://${CONTROL_PLANE_IP}:6443"
+  CP_EXTRA_FLAG="--server https://${CP1_IP}:6443"
   CP_MODE="join (additional HA node)"
 else
   CP_EXTRA_FLAG=""
@@ -163,7 +177,7 @@ fi
 # three CP IPs, all three CP DNS names, and the shared KUBE_API_HOSTNAME -
 # regardless of which node is currently being deployed, plus whatever
 # EXTRA_TLS_SAN adds on top.
-SAN_CSV="${CONTROL_PLANE_IP},${CP2_IP},${CP3_IP},${CP1_DNS_NAME},${CP2_DNS_NAME},${CP3_DNS_NAME},${KUBE_API_HOSTNAME}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
+SAN_CSV="${CP1_IP},${CP2_IP},${CP3_IP},${CP1_DNS_NAME},${CP2_DNS_NAME},${CP3_DNS_NAME},${KUBE_API_HOSTNAME}${EXTRA_TLS_SAN:+,${EXTRA_TLS_SAN}}"
 TLS_SAN_FLAGS=""
 IFS=',' read -ra SAN_VALUES <<< "${SAN_CSV}"
 for san in "${SAN_VALUES[@]}"; do
@@ -171,6 +185,15 @@ for san in "${SAN_VALUES[@]}"; do
   san="${san%"${san##*[![:space:]]}"}"
   [[ -n "${san}" ]] && TLS_SAN_FLAGS+="--tls-san=${san} "
 done
+
+# Which of the three control-plane IPs applies to *this* deployment,
+# for the informational messages below. Defaults to node 1's IP when
+# --node isn't given, matching this script's original behavior.
+case "${NODE_NUMBER}" in
+  2) THIS_NODE_IP="${CP2_IP}" ;;
+  3) THIS_NODE_IP="${CP3_IP}" ;;
+  *) THIS_NODE_IP="${CP1_IP}" ;;
+esac
 
 # --- Render Butane -> Ignition -------------------------------------------
 step "Rendering Butane template and compiling to Ignition"
@@ -264,7 +287,7 @@ VM_MAC=$(govc vm.info -json "${VM_NAME}" \
   | head -1)
 echo "VM MAC address: ${VM_MAC}"
 
-echo "Add a DHCP reservation: ${VM_MAC} -> ${CONTROL_PLANE_IP}"
+echo "Add a DHCP reservation: ${VM_MAC} -> ${THIS_NODE_IP}"
 if [[ "${WAIT_FOR_RESERVATION}" == true ]]; then
   read -r -p "Press Enter once the DHCP reservation has been added to continue with power-on... "
 fi
@@ -279,7 +302,7 @@ echo "Powered on."
 
 echo ""
 echo "Deployed ${VM_NAME}. Once booted:"
-echo "  ssh core@${CONTROL_PLANE_IP}"
+echo "  ssh core@${THIS_NODE_IP}"
 echo "  sudo cat /etc/rancher/k3s/k3s.yaml   # kubeconfig"
 echo "Note: the node reboots itself once to finalize the open-vm-tools layer,"
 echo "after k3s bootstrap has completed successfully."

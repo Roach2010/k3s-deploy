@@ -14,25 +14,21 @@ step() {
 
 # --- Argument parsing ----------------------------------------------------
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <hostname> [--wait-for-reservation|-w]"
+  echo "Usage: $0 <hostname>"
   exit 1
 fi
 VM_NAME=$1
 shift
 
-WAIT_FOR_RESERVATION=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --wait-for-reservation|-w)
-      WAIT_FOR_RESERVATION=true
-      ;;
     --cluster-init|-c|--join|-j)
       echo "--cluster-init/-c and --join/-j only apply to deploy-controlplane.sh, not workers."
       exit 1
       ;;
     *)
       echo "Unknown argument: $1"
-      echo "Usage: $0 <hostname> [--wait-for-reservation|-w]"
+      echo "Usage: $0 <hostname>"
       exit 1
       ;;
   esac
@@ -217,12 +213,7 @@ step "Resolving VM MAC address for DHCP reservation"
 VM_MAC=$(govc vm.info -json "${VM_NAME}" \
   | jq -r '.virtualMachines[0].config.hardware.device[] | select(.macAddress != null) | .macAddress' \
   | head -1)
-echo "VM MAC address: ${VM_MAC}"
-
 echo "If you want a fixed IP for ${VM_NAME}, add a DHCP reservation for ${VM_MAC} now."
-if [[ "${WAIT_FOR_RESERVATION}" == true ]]; then
-  read -r -p "Press Enter once the DHCP reservation has been added to continue with power-on... "
-fi
 
 # --- Inject Ignition and power on -----------------------------------------
 step "Injecting Ignition config and powering on"

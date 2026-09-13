@@ -112,7 +112,7 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `DOMAIN_SUFFIX` | Domain name appended to hostnames (e.g., `cluster.local`). |
 | `SSH_PUBLIC_KEY_1` | Your SSH public key (added to the `core` user on the node). |
 | `K3S_TOKEN` | A secret shared key you create for joining nodes to the cluster. |
-| `CONTROL_PLANE_IP` | IP of control-plane node 1. Nodes 2 and 3 join it directly. |
+| `CP1_IP` | IP of control-plane node 1. Nodes 2 and 3 join it directly. |
 | `CP1_DNS_NAME` | DNS name for control-plane node 1. |
 | `CP2_IP` | IP of control-plane node 2. |
 | `CP2_DNS_NAME` | DNS name for control-plane node 2. |
@@ -142,14 +142,22 @@ Run the control plane deploy script with your desired VM host name:
 ./deploy-controlplane.sh k3s-cp1
 ```
 
-#### Handling DHCP Reservations (`--wait-for-reservation`)
-If you want to pin `CONTROL_PLANE_IP` in your DHCP server before the node boots for the first time, use the `-w` or `--wait-for-reservation` flag:
+#### Handling DHCP Reservations (`--wait-for-reservation`, `--node`)
+If you want to pin a control-plane node's IP in your DHCP server before
+it boots for the first time, use the `-w`/`--wait-for-reservation` flag.
+When deploying node 2 or 3, also pass `-n`/`--node <1|2|3>` so the script
+suggests the *correct* IP for that specific node (`CP1_IP`,
+`CP2_IP`, or `CP3_IP`) instead of always assuming node 1:
 
 ```bash
-./deploy-controlplane.sh k3s-cp1 --wait-for-reservation
+./deploy-controlplane.sh k3s-cp1 --cluster-init --wait-for-reservation
+./deploy-controlplane.sh k3s-cp2 --join --wait-for-reservation --node 2
+./deploy-controlplane.sh k3s-cp3 --join --wait-for-reservation --node 3
 ```
 
-The script will configure the vSphere VM, print its generated **MAC Address**, and pause. You can then add the MAC-to-IP reservation in your router or DHCP server before pressing **Enter** to power on the VM.
+The script will configure the vSphere VM, print its generated **MAC Address** alongside the IP to reserve for it, and pause. You can then add the MAC-to-IP reservation in your router or DHCP server before pressing **Enter** to power on the VM.
+
+Worker nodes are always plain DHCP with no fixed-IP option - `deploy-worker.sh` doesn't have a `--wait-for-reservation` flag.
 
 ### Step 2: (Optional) High Availability Control Plane setup
 
@@ -165,7 +173,7 @@ By default, k3s uses an embedded SQLite database suitable for single control-pla
     ./deploy-controlplane.sh k3s-cp3 --join
     ```
     Both new nodes join node 1 directly during bootstrap
-    (`--server https://<CONTROL_PLANE_IP>:6443`), regardless of how many
+    (`--server https://<CP1_IP>:6443`), regardless of how many
     nodes are already in the cluster.
 
 Every control-plane node's certificate covers all three nodes' IPs and
@@ -219,7 +227,7 @@ When a host boots for the first time, Ignition executes the following sequence:
 Once the primary control plane node finishes its final reboot, log into the machine via SSH:
 
 ```bash
-ssh core@<CONTROL_PLANE_IP>
+ssh core@<CP1_IP>
 ```
 
 You can execute `kubectl` commands immediately on the machine:
@@ -232,7 +240,7 @@ To manage the cluster from your local workstation, copy the generated `kubeconfi
 
 ```bash
 # Copy the config to your local machine
-scp core@<CONTROL_PLANE_IP>:.kube/config ./kubeconfig
+scp core@<CP1_IP>:.kube/config ./kubeconfig
 
 # Point your local environment to the file
 export KUBECONFIG=$(pwd)/kubeconfig
@@ -265,7 +273,7 @@ journalctl -u k3s-agent-install.service -f
 
 ### Common Gotchas
 
-*   **`kubectl` cannot connect to `KUBE_API_HOSTNAME`**: Confirm it resolves to at least one control-plane IP (`CONTROL_PLANE_IP`, `CP2_IP`, `CP3_IP`) via your `/etc/hosts` or DNS server. With DNS round-robin, a down node's IP can still get handed out occasionally - just retry.
+*   **`kubectl` cannot connect to `KUBE_API_HOSTNAME`**: Confirm it resolves to at least one control-plane IP (`CP1_IP`, `CP2_IP`, `CP3_IP`) via your `/etc/hosts` or DNS server. With DNS round-robin, a down node's IP can still get handed out occasionally - just retry.
 *   **Token security**: The cluster token is saved on the node under `/etc/rancher/k3s/token` with restricted permissions (`0600`). This prevents sensitive tokens from leaking into process listings (`ps aux`).
 *   **FCOS Updates & Layering**: Fedora CoreOS updates automatically over time. Custom additions like `open-vm-tools` are layered on top of the underlying OS image via `rpm-ostree`. You can view current OS tree status using:
     ```bash
