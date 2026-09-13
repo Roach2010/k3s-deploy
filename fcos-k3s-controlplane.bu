@@ -64,7 +64,7 @@ storage:
             INSTALL_K3S_VERSION="__K3S_VERSION__" \
             INSTALL_K3S_EXEC="server \
               __TLS_SAN_FLAGS__ \
-              --write-kubeconfig-mode=644 \
+              --write-kubeconfig-mode=600 \
               --cluster-cidr=__CLUSTER_CIDR__ \
               --service-cidr=__SERVICE_CIDR__ \
               --token-file=/etc/rancher/k3s/token \
