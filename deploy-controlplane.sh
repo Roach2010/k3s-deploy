@@ -86,6 +86,7 @@ REQUIRED_VARS=(
   SSH_PUBLIC_KEY_1 K3S_TOKEN K3S_VERSION
   CLUSTER_CIDR SERVICE_CIDR KUBE_API_HOSTNAME
   CP1_IP CP1_NAME CP2_IP CP2_NAME CP3_IP CP3_NAME
+  NFS_CSI_DRIVER_VERSION
 )
 for v in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!v:-}" ]]; then
@@ -171,6 +172,15 @@ else
   CP_MODE="single-node (sqlite)"
 fi
 
+# Only install csi-driver-nfs on the node that creates the cluster
+# (single-node or --cluster-init) - not on --join nodes, to avoid running
+# the same cluster-wide install concurrently from multiple nodes.
+if [[ "${JOIN_CLUSTER}" == true ]]; then
+  INSTALL_CSI_DRIVER="false"
+else
+  INSTALL_CSI_DRIVER="true"
+fi
+
 # Expand a comma-separated SAN list into repeated --tls-san=... flags,
 # trimming whitespace around each entry. k3s supports --tls-san multiple
 # times. Every control-plane node's cert gets the SAME full set - all
@@ -209,6 +219,8 @@ sed \
   -e "s|__CP_EXTRA_FLAG__|${CP_EXTRA_FLAG}|g" \
   -e "s|__CP_MODE__|${CP_MODE}|g" \
   -e "s|__KUBE_API_HOSTNAME__|${KUBE_API_HOSTNAME}|g" \
+  -e "s|__INSTALL_CSI_DRIVER__|${INSTALL_CSI_DRIVER}|g" \
+  -e "s|__NFS_CSI_DRIVER_VERSION__|${NFS_CSI_DRIVER_VERSION}|g" \
   "${SCRIPT_DIR}/fcos-k3s-controlplane.bu" > "${OUT_DIR}/${VM_NAME}.bu"
 
 butane --pretty --strict "${OUT_DIR}/${VM_NAME}.bu" > "${OUT_DIR}/${VM_NAME}.ign"

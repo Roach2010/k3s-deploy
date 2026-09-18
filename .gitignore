@@ -2,3 +2,6 @@
 deploy.env
 rendered/
 ova/
+
+# --- Real config for in-cluster manifests (contains actual NFS server details) ---
+manifests/nfs-csi/overlay/

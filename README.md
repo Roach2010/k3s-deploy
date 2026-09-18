@@ -64,7 +64,15 @@ Before running scripts, it helps to understand what is happening under the hood.
 ├── fcos-k3s-worker.bu         # Butane YAML template for Worker nodes
 ├── deploy-controlplane.sh     # Self-contained deployment script for Control Plane
 ├── deploy-worker.sh           # Self-contained deployment script for Workers
+├── inject-controlplane.sh     # Injects Ignition into an existing Control Plane VM (no import)
+├── inject-worker.sh           # Injects Ignition into an existing Worker VM (no import)
 ├── deploy.env.example         # Template for cluster configuration and credentials
+├── manifests/
+│   └── nfs-csi/
+│       ├── base/               # Generic StorageClass (safe to commit)
+│       ├── overlay.example/    # Template patch - copy to overlay/ and edit
+│       ├── overlay/            # Your real NFS server details (Git-ignored)
+│       └── examples/           # Standalone PVC/PV examples, copy per workload
 ├── .gitignore                 # Prevents secrets, cache, and rendered output from hitting Git
 ├── rendered/                  # Transient output directory for compiled .ign files (Git-ignored)
 └── ova/                       # Local cache directory for downloaded FCOS binaries (Git-ignored)
@@ -123,6 +131,7 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `K3S_VERSION` | Exact release tag of k3s (e.g., `v1.30.4+k3s1`). |
 | `CLUSTER_CIDR` | Internal IP space reserved for Pods (e.g., `10.42.0.0/16`). |
 | `SERVICE_CIDR` | Internal IP space reserved for Services (e.g., `10.43.0.0/16`). |
+| `NFS_CSI_DRIVER_VERSION` | Version tag of `csi-driver-nfs` to install (e.g., `v4.13.0`). See [NFS Storage](#setting-up-nfs-storage-csi-driver-nfs) below. |
 
 Make the deployment scripts executable:
 
@@ -211,6 +220,34 @@ Worker nodes run workloads and report back to the control plane. Pass a unique h
 ./deploy-worker.sh k3s-worker2
 ```
 
+### Re-injecting Config Into an Already-Existing VM
+
+`inject-controlplane.sh` and `inject-worker.sh` do the same Butane
+rendering and Ignition compilation as the two scripts above, but skip
+every VM-*creation* step - no datastore selection, no import spec, no
+`govc import.ova`. Use these when the VM already exists in vSphere (e.g.
+you imported it some other way) and you just need to (re-)inject its
+Ignition config:
+
+```bash
+./inject-controlplane.sh k3s-cp1 --cluster-init
+./inject-worker.sh k3s-worker1
+```
+
+They take the same role-specific flags as their `deploy-*.sh`
+counterparts (`--cluster-init`/`-c`, `--join`/`-j`, `--node`/`-n`,
+`--wait-for-reservation`/`-w` for control-plane; none for workers), plus
+one new one: `--power-on`/`-p`. **Neither script powers the VM on by
+default** - injection only, unless you pass that flag.
+
+**This only does something useful if the VM has never been powered on
+before.** Ignition runs once, during a VM's very first boot - it is not
+a configuration-management tool that reapplies on every reboot. Injecting
+new `guestinfo` into a VM that's already completed its first boot (even
+if you then reboot it) will not retroactively apply the new config; you'd
+need to re-import a fresh VM instead. Both scripts print a reminder of
+this after injecting.
+
 ---
 
 ## 6. Accessing and Operating the Cluster
@@ -220,7 +257,8 @@ When a host boots for the first time, Ignition executes the following sequence:
 2. Runs a systemd setup unit that installs `k3s`.
 3. Runs `rpm-ostree install open-vm-tools` to add VMware drivers to the base FCOS image.
 4. Generates a user-accessible `kubeconfig` file at `/home/core/.kube/config`.
-5. Initiates an automated system reboot to finalize the `rpm-ostree` driver layer.
+5. On the node that creates the cluster (single-node deploy, or `--cluster-init`) only: installs `csi-driver-nfs` against the running API server. `--join` nodes skip this step.
+6. Initiates an automated system reboot to finalize the `rpm-ostree` driver layer.
 
 ### Connecting to the Cluster with `kubectl`
 
@@ -251,6 +289,98 @@ kubectl get nodes -o wide
 
 > **Why check `/home/core/.kube/config` instead of `/etc/rancher/k3s/k3s.yaml`?**
 > The system file at `/etc/rancher/k3s/k3s.yaml` is k3s's internal admin configuration. k3s automatically overwrites this file on every service restart to point to `127.0.0.1:6443`. To protect user settings, our deployment script creates a separate one-time copy in `/home/core/.kube/config` mapped to `KUBE_API_HOSTNAME`.
+
+### Setting Up NFS Storage (`csi-driver-nfs`)
+
+The cluster-creating control-plane node automatically installs
+[`csi-driver-nfs`](https://github.com/kubernetes-csi/csi-driver-nfs)
+(version `NFS_CSI_DRIVER_VERSION`). That gets you the CSI driver itself -
+it does **not** create a `StorageClass`, since this toolkit has no way to
+know your actual NFS server's address or export path.
+
+Confirm the driver installed:
+
+```bash
+kubectl get pods -n kube-system -l app=csi-nfs-controller
+kubectl get pods -n kube-system -l app=csi-nfs-node
+```
+
+#### Creating the `StorageClass` (Kustomize)
+
+The `StorageClass` lives under `manifests/nfs-csi/` as a Kustomize base
+plus an example overlay - the same `.example` pattern `deploy.env.example`
+uses: the base is generic and safe to commit, the real overlay (with your
+actual NAS address) is gitignored.
+
+```bash
+cp -r manifests/nfs-csi/overlay.example manifests/nfs-csi/overlay
+```
+
+Edit `manifests/nfs-csi/overlay/storageclass-patch.yaml`, filling in your
+own `server` and `share` (the mount options are already tuned for
+Synology DSM - `nfsvers=4.1` since DSM doesn't support 4.2):
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-csi
+parameters:
+  server: <your-nas-ip-or-hostname>
+  share: <path-to-your-nfs-export>
+mountOptions:
+  - nfsvers=4.1
+  - nconnect=4
+  - rsize=1048576
+  - wsize=1048576
+  - noatime
+  - hard
+  - timeo=600
+```
+
+Then apply it:
+
+```bash
+kubectl apply -k manifests/nfs-csi/overlay/
+```
+
+NFSv4.1 needs to be enabled on the NAS side too (on Synology DSM: Control
+Panel → File Services → NFS).
+
+#### Creating a PersistentVolumeClaim
+
+There are two ways to actually consume storage, matching
+`csi-driver-nfs`'s own terminology for them. Example files for both are
+under `manifests/nfs-csi/examples/` - copy and edit per workload, these
+aren't part of the Kustomize setup above since PVCs are one-off rather
+than environment config.
+
+**Dynamic provisioning** (`examples/pvc-dynamic.yaml`) - let the driver
+create a new subdirectory under your `share` path automatically, one per
+`PersistentVolumeClaim`. Simplest option, and what most workloads should
+use - no `PersistentVolume` needed, just a PVC referencing the
+`StorageClass` above:
+
+```bash
+kubectl apply -f manifests/nfs-csi/examples/pvc-dynamic.yaml
+```
+
+**Static provisioning** (`examples/pv-static.yaml` +
+`examples/pvc-static.yaml`) - bind to one *specific*, already-existing
+folder on your NAS instead of letting the driver create a new one. Use
+this when you have an existing folder structure you want a workload to
+reuse. Edit the `server`/`share`/`volumeHandle` placeholders in
+`pv-static.yaml` first, following the
+[driver's own static provisioning example](https://github.com/kubernetes-csi/csi-driver-nfs/blob/master/deploy/example/README.md#pvpvc-usage-static-provisioning),
+then apply both:
+
+```bash
+kubectl apply -f manifests/nfs-csi/examples/pv-static.yaml
+kubectl apply -f manifests/nfs-csi/examples/pvc-static.yaml
+kubectl get pv,pvc
+```
+
+`STATUS` should read `Bound` for both once the claim picks up the volume.
 
 ---
 

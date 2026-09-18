@@ -117,6 +117,38 @@ storage:
           chmod 0700 /home/core/.kube
           chmod 0600 /home/core/.kube/config
 
+          if [ "__INSTALL_CSI_DRIVER__" = "true" ]; then
+            log "Installing csi-driver-nfs __NFS_CSI_DRIVER_VERSION__"
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            export PATH="/usr/local/bin:${PATH}"
+
+            log "Waiting for the Kubernetes API to accept requests"
+            API_UP=false
+            for i in $(seq 1 30); do
+              if kubectl get --raw=/readyz &>/dev/null; then
+                API_UP=true
+                break
+              fi
+              echo "    still waiting on the API server... (${i}/30)"
+              sleep 2
+            done
+
+            CSI_NFS_INSTALL_URL="https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/__NFS_CSI_DRIVER_VERSION__/deploy/install-driver.sh"
+            if [ "${API_UP}" = true ]; then
+              if curl -skSL "${CSI_NFS_INSTALL_URL}" | bash -s __NFS_CSI_DRIVER_VERSION__ --; then
+                log "csi-driver-nfs installed"
+              else
+                log "WARNING: csi-driver-nfs install failed. The k3s cluster itself is fine -"
+                log "retry manually later: curl -skSL ${CSI_NFS_INSTALL_URL} | bash -s __NFS_CSI_DRIVER_VERSION__ --"
+              fi
+            else
+              log "WARNING: API server did not become ready in time; skipping csi-driver-nfs install."
+              log "Install it manually later: curl -skSL ${CSI_NFS_INSTALL_URL} | bash -s __NFS_CSI_DRIVER_VERSION__ --"
+            fi
+          else
+            log "Skipping csi-driver-nfs install (additional HA node joining an existing cluster)"
+          fi
+
           log "Marking bootstrap complete"
           touch /etc/k3s-bootstrap-complete
 
