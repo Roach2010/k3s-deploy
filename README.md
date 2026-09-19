@@ -120,13 +120,16 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `DOMAIN_SUFFIX` | Domain name appended to hostnames (e.g., `cluster.local`). |
 | `SSH_PUBLIC_KEY_1` | Your SSH public key (added to the `core` user on the node). |
 | `K3S_TOKEN` | A secret shared key you create for joining nodes to the cluster. |
-| `CP1_IP` | IP of control-plane node 1. Nodes 2 and 3 join it directly. |
+| `CP1_IP` | IP of control-plane node 1. |
 | `CP1_NAME` | Hostname for control-plane node 1 (`DOMAIN_SUFFIX` is appended automatically). |
 | `CP2_IP` | IP of control-plane node 2. |
 | `CP2_NAME` | Hostname for control-plane node 2. |
 | `CP3_IP` | IP of control-plane node 3. |
 | `CP3_NAME` | Hostname for control-plane node 3. |
-| `KUBE_API_HOSTNAME` | Shared API DNS name (point three A records at it - see Step 2). |
+| `KUBE_API_HOSTNAME` | Shared API DNS name: one A record pointing to `KUBE_VIP`. |
+| `KUBE_VIP` | Unused API virtual IP, default `192.168.60.10`. Exclude it from DHCP. |
+| `KUBE_VIP_INTERFACE` | NIC on every control-plane VM that shares the VIP subnet; verify with `ip -br link`. |
+| `KUBE_VIP_VERSION` | Pinned kube-vip image tag, default `v1.2.4`. |
 | `EXTRA_TLS_SAN` | *(Optional)* Extra IPs or hostnames to include in the API server TLS certificate. |
 | `K3S_VERSION` | Exact release tag of k3s (e.g., `v1.30.4+k3s1`). |
 | `CLUSTER_CIDR` | Internal IP space reserved for Pods (e.g., `10.42.0.0/16`). |
@@ -148,7 +151,7 @@ chmod +x deploy-controlplane.sh deploy-worker.sh
 Run the control plane deploy script with your desired VM host name:
 
 ```bash
-./deploy-controlplane.sh k3s-cp1
+./deploy-controlplane.sh k3s-cp1 --cluster-init
 ```
 
 #### Handling DHCP Reservations (`--wait-for-reservation`, `--node`)
@@ -168,7 +171,7 @@ The script will configure the vSphere VM, print its generated **MAC Address** al
 
 Worker nodes are always plain DHCP with no fixed-IP option - `deploy-worker.sh` doesn't have a `--wait-for-reservation` flag.
 
-### Step 2: (Optional) High Availability Control Plane setup
+### Step 2: High Availability Control Plane and API failover
 
 By default, k3s uses an embedded SQLite database suitable for single control-plane setups. If you want a High Availability (HA) control plane with multiple API nodes, k3s uses an embedded **Etcd** cluster instead.
 
@@ -178,38 +181,74 @@ By default, k3s uses an embedded SQLite database suitable for single control-pla
     ```
 2.  **Join additional control plane nodes**:
     ```bash
-    ./deploy-controlplane.sh k3s-cp2 --join
-    ./deploy-controlplane.sh k3s-cp3 --join
+    ./deploy-controlplane.sh k3s-cp2 --join --node 2
+    ./deploy-controlplane.sh k3s-cp3 --join --node 3
     ```
-    Both new nodes join node 1 directly during bootstrap
-    (`--server https://<CP1_IP>:6443`), regardless of how many
-    nodes are already in the cluster.
+    Wait for node 1 to finish its automatic reboot and for the VIP API to
+    become reachable before joining node 2. Wait for node 2 to finish its
+    reboot and become Ready before joining node 3. Both join through
+    `https://<KUBE_VIP>:6443`. Deploy node 1 only once, with `--cluster-init`;
+    this step describes the same first deployment as Step 1.
 
 Every control-plane node's certificate covers all three nodes' IPs and
-DNS names, plus `KUBE_API_HOSTNAME` - so `kubectl` or a worker can reach
+DNS names, plus `KUBE_API_HOSTNAME` and `KUBE_VIP` - so `kubectl` or a worker can reach
 any node directly, or via the shared name, without a TLS error.
 
 #### Making the API Reachable if a Node Goes Down (`KUBE_API_HOSTNAME`)
 
-HA etcd keeps your cluster's *data* safe if a control-plane node dies,
-but it doesn't tell `kubectl` or your workers which surviving node to
-talk to instead. That's what `KUBE_API_HOSTNAME` is for - a single name
-your workers and your local `kubectl` always point at, resolved to
-whichever nodes are actually up.
+Ignition writes kube-vip RBAC and an ARP-mode DaemonSet to
+`/var/lib/rancher/k3s/server/manifests/kube-vip.yaml` on every server.
+K3s applies it automatically; kube-vip runs only on control-plane nodes.
+One elected node owns `192.168.60.10`. If it fails, another advertises the
+same IP. Existing connections may need to reconnect during election.
+This provides automatic failover, without distributing API connections
+across all servers. Service load balancing is disabled in kube-vip;
+the existing K3s ServiceLB configuration is unchanged.
 
-This repo supports two ways to set that up:
+Before deployment:
 
-*   **DNS round-robin (simplest)**: point `KUBE_API_HOSTNAME` at three A
-    records, one per control-plane IP. No extra infrastructure, but plain
-    DNS has no health checking - if a node is down, its IP can still get
-    handed out, and that one connection attempt will need a retry.
-*   **External load balancer or VIP (more robust)**: put something like
-    `kube-vip` or a hardware/software load balancer in front of the three
-    nodes, and point `KUBE_API_HOSTNAME` at that instead. Handles failover
-    properly, at the cost of extra infrastructure to run.
+* Reserve `192.168.60.10` outside the DHCP pool; do not assign it to a VM
+  or a DHCP reservation. Keep each VM's individual IP reservation.
+* Put all control-plane NICs on the same layer-2 VLAN/subnet as the VIP.
+  The network must permit gratuitous ARP and traffic to TCP 6443.
+* Set `KUBE_VIP_INTERFACE` to the actual NIC name shared by the VMs.
+  `ens192` in the example is not auto-detected. Bootstrap fails clearly
+  if that interface does not exist.
+* Create **one** DNS A record: `KUBE_API_HOSTNAME` -> `192.168.60.10`.
+  Remove any old round-robin records for that name.
 
-Either way, worker nodes join via `KUBE_API_HOSTNAME` too, so they get
-the same failover behavior automatically.
+The DaemonSet authenticates with its ServiceAccount against each node's
+local API (`127.0.0.1:6443`), so acquiring the VIP does not require the
+VIP to be up. Keep the rendered manifest identical on every server.
+Workers and the user's kubeconfig continue using `KUBE_API_HOSTNAME`.
+
+After node 1 reboots, inspect startup over its individual IP:
+
+```bash
+ssh core@192.168.60.11
+sudo k3s kubectl -n kube-system rollout status daemonset/kube-vip-ds --timeout=180s
+sudo k3s kubectl --server=https://192.168.60.10:6443 get --raw=/readyz
+```
+
+After all **three** etcd servers have finished bootstrapping and are Ready,
+verify failover from a separate workstation using the copied kubeconfig:
+
+```bash
+kubectl get nodes -o wide
+kubectl -n kube-system get pods -l app=kube-vip -o wide
+kubectl -n kube-system get leases
+```
+
+Identify the VIP owner with `ip -4 addr show dev <interface>` on each
+server. Power off only that VM, then repeat `kubectl get nodes` through
+the shared endpoint until it succeeds. Confirm the VIP moved to another
+server, restore the VM, and wait for all three nodes to become Ready.
+Do not test node failure while only one or two etcd servers exist: quorum
+cannot tolerate losing a member. A single-node SQLite deployment remains
+possible without `--cluster-init`, but has no node-failure tolerance.
+
+References: [kube-vip on K3s](https://kube-vip.io/docs/usage/k3s/),
+[ARP DaemonSet](https://kube-vip.io/docs/installation/daemonset/).
 
 ### Step 3: Deploy Worker Nodes
 
@@ -403,7 +442,7 @@ journalctl -u k3s-agent-install.service -f
 
 ### Common Gotchas
 
-*   **`kubectl` cannot connect to `KUBE_API_HOSTNAME`**: Confirm it resolves to at least one control-plane IP (`CP1_IP`, `CP2_IP`, `CP3_IP`) via your `/etc/hosts` or DNS server. With DNS round-robin, a down node's IP can still get handed out occasionally - just retry.
+*   **`kubectl` cannot connect to `KUBE_API_HOSTNAME`**: Confirm its single A record resolves to `KUBE_VIP`. Connect over an individual node IP and inspect `sudo k3s kubectl -n kube-system logs -l app=kube-vip --tail=100`, the configured NIC, and the VIP lease. Verify etcd quorum and same-VLAN connectivity.
 *   **Token security**: The cluster token is saved on the node under `/etc/rancher/k3s/token` with restricted permissions (`0600`). This prevents sensitive tokens from leaking into process listings (`ps aux`).
 *   **FCOS Updates & Layering**: Fedora CoreOS updates automatically over time. Custom additions like `open-vm-tools` are layered on top of the underlying OS image via `rpm-ostree`. You can view current OS tree status using:
     ```bash

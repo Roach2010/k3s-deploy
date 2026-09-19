@@ -16,6 +16,104 @@ storage:
       mode: 0755
 
   files:
+    # Identical on all servers: K3s does not replicate its manifests directory.
+    # Use the local API so leader election never depends on the VIP it manages.
+    - path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+      mode: 0644
+      contents:
+        inline: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          rules:
+            - apiGroups: ["coordination.k8s.io"]
+              resources: ["leases"]
+              verbs: ["get", "list", "watch", "create", "update", "patch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: kube-vip
+          subjects:
+            - kind: ServiceAccount
+              name: kube-vip
+              namespace: kube-system
+          ---
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: kube-vip-ds
+            namespace: kube-system
+          spec:
+            selector:
+              matchLabels:
+                app: kube-vip
+            template:
+              metadata:
+                labels:
+                  app: kube-vip
+              spec:
+                serviceAccountName: kube-vip
+                hostNetwork: true
+                dnsPolicy: ClusterFirstWithHostNet
+                priorityClassName: system-node-critical
+                nodeSelector:
+                  node-role.kubernetes.io/control-plane: "true"
+                tolerations:
+                  - operator: Exists
+                    effect: NoSchedule
+                  - operator: Exists
+                    effect: NoExecute
+                containers:
+                  - name: kube-vip
+                    image: ghcr.io/kube-vip/kube-vip:__KUBE_VIP_VERSION__
+                    imagePullPolicy: IfNotPresent
+                    args: ["manager"]
+                    securityContext:
+                      capabilities:
+                        add: ["NET_ADMIN", "NET_RAW"]
+                    env:
+                      - name: KUBERNETES_SERVICE_HOST
+                        value: "127.0.0.1"
+                      - name: KUBERNETES_SERVICE_PORT
+                        value: "6443"
+                      - name: vip_arp
+                        value: "true"
+                      - name: vip_interface
+                        value: "__KUBE_VIP_INTERFACE__"
+                      - name: vip_subnet
+                        value: "32"
+                      - name: address
+                        value: "__KUBE_VIP__"
+                      - name: port
+                        value: "6443"
+                      - name: cp_enable
+                        value: "true"
+                      - name: cp_namespace
+                        value: "kube-system"
+                      - name: svc_enable
+                        value: "false"
+                      - name: vip_leaderelection
+                        value: "true"
+                      - name: vip_leaseduration
+                        value: "15"
+                      - name: vip_renewdeadline
+                        value: "10"
+                      - name: vip_retryperiod
+                        value: "2"
     - path: /etc/hostname
       mode: 0644
       contents:
@@ -50,6 +148,12 @@ storage:
           fi
 
           log "Starting k3s control-plane bootstrap"
+
+          if ! ip link show dev "__KUBE_VIP_INTERFACE__" >/dev/null 2>&1; then
+            log "ERROR: kube-vip interface __KUBE_VIP_INTERFACE__ does not exist."
+            ip -br link
+            exit 1
+          fi
 
           log "Checking for open-vm-tools"
           if ! rpm -q open-vm-tools &>/dev/null; then
