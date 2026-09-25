@@ -1,0 +1,55 @@
+---
+- name: Install cert-manager
+  kubernetes.core.helm:
+    name: cert-manager
+    chart_ref: oci://quay.io/jetstack/charts/cert-manager
+    chart_version: "{{ cert_manager_version }}"
+    release_namespace: cert-manager
+    create_namespace: true
+    kubeconfig: "{{ kubeconfig }}"
+    values:
+      crds:
+        enabled: true
+    wait: true
+    timeout: 5m
+    atomic: true
+    state: present
+
+- name: Wait for cert-manager controller
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: cert-manager
+    name: cert-manager
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+
+- name: Wait for cert-manager webhook
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: cert-manager
+    name: cert-manager-webhook
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300
+
+- name: Wait for cert-manager CA injector
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: cert-manager
+    name: cert-manager-cainjector
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 300

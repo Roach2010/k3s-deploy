@@ -1,0 +1,10 @@
+---
+- name: Bootstrap K3s cluster applications
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  roles:
+    - cert_manager
+    - cloudflare
+    - cluster_issuer

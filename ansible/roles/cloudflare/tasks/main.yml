@@ -1,0 +1,15 @@
+---
+- name: Create Cloudflare API token secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: cloudflare-api-token-secret
+        namespace: cert-manager
+      type: Opaque
+      stringData:
+        api-token: "{{ vault_cloudflare_api_token }}"
+  no_log: true

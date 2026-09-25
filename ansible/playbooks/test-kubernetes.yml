@@ -1,0 +1,17 @@
+---
+- name: Test Kubernetes API access
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Get Kubernetes nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Node
+      register: cluster_nodes
+
+    - name: Display nodes
+      ansible.builtin.debug:
+        msg: "{{ cluster_nodes.resources | map(attribute='metadata.name') | list }}"

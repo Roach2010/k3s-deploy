@@ -1,0 +1,41 @@
+---
+- name: Create namespace for certificate test
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: certificate-test
+
+- name: Request staging certificate
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: letsencrypt-staging-test
+        namespace: certificate-test
+      spec:
+        secretName: letsencrypt-staging-test-tls
+        issuerRef:
+          name: letsencrypt-staging
+          kind: ClusterIssuer
+        dnsNames:
+          - "cert-test.{{ domain }}"
+
+- name: Wait for staging certificate
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    name: letsencrypt-staging-test
+    namespace: certificate-test
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: 300
