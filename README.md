@@ -8,7 +8,7 @@ If you already know your way around Linux (`systemctl`, `journalctl`, system net
 
 ## 1. Core Architecture & Concepts
 
-Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping.
+Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping. Once the nodes are ready, Ansible installs the cluster services: the NFS CSI driver, cert-manager, the Cloudflare API token Secret, and Let's Encrypt ClusterIssuers.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -53,6 +53,7 @@ Before running scripts, it helps to understand what is happening under the hood.
 *   **k3s**: A lightweight Kubernetes distribution packaged as a single binary. 
     *   **Control Plane (`k3s server`)**: Hosts the API server, scheduler, controller manager, and datastore (SQLite or Etcd).
     *   **Worker (`k3s agent`)**: Runs the `kubelet` and container runtime to execute your workload containers.
+*   **Ansible**: Runs on your management machine and configures cluster services through the Kubernetes API. Butane/Ignition manages the nodes; Ansible manages the NFS CSI Kubernetes resources after node provisioning.
 
 ---
 
@@ -67,12 +68,21 @@ Before running scripts, it helps to understand what is happening under the hood.
 ├── inject-controlplane.sh     # Injects Ignition into an existing Control Plane VM (no import)
 ├── inject-worker.sh           # Injects Ignition into an existing Worker VM (no import)
 ├── deploy.env.example         # Template for cluster configuration and credentials
-├── manifests/
-│   └── nfs-csi/
-│       ├── base/               # Generic StorageClass (safe to commit)
-│       ├── overlay.example/    # Template patch - copy to overlay/ and edit
-│       ├── overlay/            # Your real NFS server details (Git-ignored)
-│       └── examples/           # Standalone PVC/PV examples, copy per workload
+├── ansible/
+│   ├── ansible.cfg            # Local inventory, role paths, and Vault password file
+│   ├── requirements.yml       # Required Ansible collections
+│   ├── inventory/
+│   │   ├── hosts.yml          # Runs cluster management tasks on localhost
+│   │   └── group_vars/all/    # Cluster variables and encrypted Vault secrets
+│   ├── playbooks/
+│   │   ├── bootstrap-cluster.yml # Installs cluster services
+│   │   └── test-kubernetes.yml
+│   └── roles/
+│       ├── nfs_csi/           # Versioned NFS CSI manifests and readiness checks
+│       ├── cert_manager/      # cert-manager Helm release
+│       ├── cloudflare/        # Cloudflare API token Secret
+│       ├── cluster_issuer/    # Let's Encrypt staging and production issuers
+│       └── certificate_test/
 ├── .gitignore                 # Prevents secrets, cache, and rendered output from hitting Git
 ├── rendered/                  # Transient output directory for compiled .ign files (Git-ignored)
 └── ova/                       # Local cache directory for downloaded FCOS binaries (Git-ignored)
@@ -88,6 +98,23 @@ Ensure you have the following command-line utilities installed on your workstati
 2.  **`butane`**: CoreOS configuration compiler.
 3.  **`jq`**: Command-line JSON processor.
 4.  **`curl`**: Standard transfer tool used to fetch CoreOS release metadata.
+
+For cluster bootstrap, your Ansible management machine also needs **Python 3.11+**, **Ansible Core 2.19**, **Helm 3**, and **`kubectl`**. In your Ansible Python environment, install the Kubernetes client dependencies and the repository's collection requirements:
+
+```bash
+python -m pip install kubernetes PyYAML jsonpatch
+cd ansible
+ansible-galaxy collection install -r requirements.yml
+```
+
+For more reliable change detection in Helm tasks, install the Helm diff plugin as the same user who runs Ansible:
+
+```bash
+helm plugin install https://github.com/databus23/helm-diff
+helm diff version
+```
+
+If it is already installed, use `helm plugin update diff`. Helm is used for cert-manager; the NFS CSI role applies Kubernetes manifests directly.
 
 ### Infrastructure Requirements
 *   An active vCenter account with permissions to deploy VMs and access Datastores.
@@ -134,7 +161,19 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `K3S_VERSION` | Exact release tag of k3s (e.g., `v1.30.4+k3s1`). |
 | `CLUSTER_CIDR` | Internal IP space reserved for Pods (e.g., `10.42.0.0/16`). |
 | `SERVICE_CIDR` | Internal IP space reserved for Services (e.g., `10.43.0.0/16`). |
-| `NFS_CSI_DRIVER_VERSION` | Version tag of `csi-driver-nfs` to install (e.g., `v4.13.0`). See [NFS Storage](#setting-up-nfs-storage-csi-driver-nfs) below. |
+
+Cluster service settings live separately in `ansible/inventory/group_vars/all/vars.yml`:
+
+| Variable | Description |
+| :--- | :--- |
+| `kubeconfig` | Path to the Kubernetes credentials on the Ansible machine. Defaults to `~/.kube/config`. |
+| `domain` | DNS zone used for certificate requests. |
+| `cert_manager_version` | Pinned cert-manager Helm chart version. |
+| `letsencrypt_email` | Contact email for the Let's Encrypt accounts. |
+| `nfs_csi_version` | Optional override of the NFS CSI role default, currently `v4.13.4`. |
+| `nfs_csi_wait_timeout` | Optional override of the driver readiness timeout, currently 300 seconds per resource. |
+
+Keep `vault_cloudflare_api_token` in the encrypted `ansible/inventory/group_vars/all/vault.yml`. The Ansible configuration reads the Vault password from `~/.ansible/.vault_pass`.
 
 Make the deployment scripts executable:
 
@@ -291,13 +330,14 @@ this after injecting.
 
 ## 6. Accessing and Operating the Cluster
 
-When a host boots for the first time, Ignition executes the following sequence:
-1. Formats disk partitions, writes SSH keys, and generates system config.
-2. Runs a systemd setup unit that installs `k3s`.
-3. Runs `rpm-ostree install open-vm-tools` to add VMware drivers to the base FCOS image.
-4. Generates a user-accessible `kubeconfig` file at `/home/core/.kube/config`.
-5. On the node that creates the cluster (single-node deploy, or `--cluster-init`) only: installs `csi-driver-nfs` against the running API server. `--join` nodes skip this step.
-6. Initiates an automated system reboot to finalize the `rpm-ostree` driver layer.
+When a host boots for the first time, Ignition and the systemd setup unit perform the following sequence:
+1. Ignition writes SSH keys, configuration files, and the setup unit.
+2. The setup unit runs `rpm-ostree install -y open-vm-tools` if VMware tools are not already present.
+3. Installs and starts `k3s server` or `k3s agent`. On servers, K3s also applies the kube-vip manifest written by Ignition.
+4. On control-plane nodes, generates a user-accessible `kubeconfig` file at `/home/core/.kube/config`.
+5. Marks node bootstrap complete and initiates an automated system reboot to finalize the package layer.
+
+After the nodes finish rebooting, run the Ansible cluster bootstrap below. NFS CSI installation is no longer part of the first-boot script.
 
 ### Connecting to the Cluster with `kubectl`
 
@@ -331,92 +371,128 @@ kubectl get nodes -o wide
 
 ### Setting Up NFS Storage (`csi-driver-nfs`)
 
-The cluster-creating control-plane node automatically installs
+The Ansible `nfs_csi` role installs
 [`csi-driver-nfs`](https://github.com/kubernetes-csi/csi-driver-nfs)
-(version `NFS_CSI_DRIVER_VERSION`). That gets you the CSI driver itself -
-it does **not** create a `StorageClass`, since this toolkit has no way to
-know your actual NFS server's address or export path.
+after the nodes are ready. It applies the pinned upstream RBAC, CSIDriver,
+controller Deployment, and node DaemonSet manifests. The driver runs in
+`kube-system` and registers as `nfs.csi.k8s.io`. It does **not** create a
+`StorageClass`, NAS exports, or application PVs/PVCs.
+
+The existing FCOS host NFS support stays in place. This migration needs no
+additional package layering or host NFS mount units in either Butane template.
+The driver image includes its own NFS client utilities, and its privileged
+node plugin shares mounts with the host's `/var/lib/kubelet/pods` directory.
+Nodes still need kernel NFS support and network access to the NAS.
+
+From the repository root, first confirm the nodes are ready, then run the
+cluster bootstrap:
+
+```bash
+kubectl get nodes -o wide
+cd ansible
+ansible-playbook playbooks/bootstrap-cluster.yml --syntax-check
+ansible-playbook playbooks/bootstrap-cluster.yml
+```
+
+Before running Ansible, set `kubeconfig` in `inventory/group_vars/all/vars.yml`
+to your credentials file. Its default is `~/.kube/config`; exporting
+`KUBECONFIG` for `kubectl` above does not override this explicit Ansible variable.
+Run the playbook from `ansible/` so its configuration, inventory, and role
+paths are used.
+
+Bootstrap runs `nfs_csi`, `cert_manager`, `cloudflare`, and `cluster_issuer`
+in that order. The NFS role uses `kubernetes.core.k8s` with `apply: true`,
+so repeated runs reconcile the same objects. It waits up to 300 seconds each
+for the controller Deployment and node DaemonSet, then checks the driver
+registration. Failed applies or readiness timeouts stop the playbook.
+Readiness and registration checks are skipped in Ansible check mode.
+
+To run only the NFS role, from the same directory:
+
+```bash
+ansible-playbook playbooks/bootstrap-cluster.yml --tags nfs_csi
+```
+
+The default version is `v4.13.4`, configured in
+`roles/nfs_csi/defaults/main.yml`, matching the existing cluster installation.
+This transfers management to Ansible without changing the driver version.
+Keep the existing driver and PVs/PVCs in place; this handover does not require
+uninstalling them or adopting a Helm release. Existing nodes do not need to
+rerun Ignition. Future version changes can be set through `nfs_csi_version`
+in inventory variables.
 
 Confirm the driver installed:
 
 ```bash
-kubectl get pods -n kube-system -l app=csi-nfs-controller
-kubectl get pods -n kube-system -l app=csi-nfs-node
+kubectl get csidriver nfs.csi.k8s.io
+kubectl get pods -n kube-system -l app=csi-nfs-controller -o wide
+kubectl get pods -n kube-system -l app=csi-nfs-node -o wide
+kubectl rollout status deployment/csi-nfs-controller -n kube-system --timeout=300s
+kubectl rollout status daemonset/csi-nfs-node -n kube-system --timeout=300s
 ```
 
-#### Creating the `StorageClass` (Kustomize)
+Rerun the tagged playbook to check that an unchanged installation reports
+`changed=0`. Also test a workload mounting your NAS export: driver readiness
+alone does not verify export permissions or access to the stored data.
 
-The `StorageClass` lives under `manifests/nfs-csi/` as a Kustomize base
-plus an example overlay - the same `.example` pattern `deploy.env.example`
-uses: the base is generic and safe to commit, the real overlay (with your
-actual NAS address) is gitignored.
+#### Creating the `StorageClass` (Optional)
 
-```bash
-cp -r manifests/nfs-csi/overlay.example manifests/nfs-csi/overlay
-```
-
-Edit `manifests/nfs-csi/overlay/storageclass-patch.yaml`, filling in your
-own `server` and `share` (the mount options are already tuned for
-Synology DSM - `nfsvers=4.1` since DSM doesn't support 4.2):
+A `StorageClass` is needed for dynamic provisioning, where the driver creates
+a subdirectory for each claim. The repository does not currently include
+the previously documented `manifests/nfs-csi/` Kustomize files. If you need
+dynamic provisioning, save the following as your own `storageclass.yaml`,
+filling in your NAS address and export path:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: nfs-csi
+provisioner: nfs.csi.k8s.io
 parameters:
   server: <your-nas-ip-or-hostname>
   share: <path-to-your-nfs-export>
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
 mountOptions:
   - nfsvers=4.1
-  - nconnect=4
-  - rsize=1048576
-  - wsize=1048576
-  - noatime
-  - hard
-  - timeo=600
 ```
 
 Then apply it:
 
 ```bash
-kubectl apply -k manifests/nfs-csi/overlay/
+kubectl apply -f storageclass.yaml
 ```
 
 NFSv4.1 needs to be enabled on the NAS side too (on Synology DSM: Control
-Panel → File Services → NFS).
+Panel → File Services → NFS). Allow the relevant node addresses in the
+export permissions. `Retain` leaves the volume and its data for manual
+cleanup after a claim is deleted.
 
 #### Creating a PersistentVolumeClaim
 
 There are two ways to actually consume storage, matching
-`csi-driver-nfs`'s own terminology for them. Example files for both are
-under `manifests/nfs-csi/examples/` - copy and edit per workload, these
-aren't part of the Kustomize setup above since PVCs are one-off rather
-than environment config.
+`csi-driver-nfs`'s own terminology for them. PVs and PVCs belong to the
+workload configuration, separate from the cluster driver installation.
 
-**Dynamic provisioning** (`examples/pvc-dynamic.yaml`) - let the driver
-create a new subdirectory under your `share` path automatically, one per
-`PersistentVolumeClaim`. Simplest option, and what most workloads should
-use - no `PersistentVolume` needed, just a PVC referencing the
-`StorageClass` above:
+**Dynamic provisioning** - let the driver create a new subdirectory under
+your `share` path automatically, one per `PersistentVolumeClaim`. Create a
+PVC with `storageClassName: nfs-csi` to use the `StorageClass` above; the
+driver creates the PV for you.
 
-```bash
-kubectl apply -f manifests/nfs-csi/examples/pvc-dynamic.yaml
-```
-
-**Static provisioning** (`examples/pv-static.yaml` +
-`examples/pvc-static.yaml`) - bind to one *specific*, already-existing
-folder on your NAS instead of letting the driver create a new one. Use
-this when you have an existing folder structure you want a workload to
-reuse. Edit the `server`/`share`/`volumeHandle` placeholders in
-`pv-static.yaml` first, following the
+**Static provisioning** - bind to one *specific*, already-existing folder
+on your NAS instead of letting the driver create a new one. Define a PV
+with `csi.driver: nfs.csi.k8s.io`, the `server`/`share` attributes, and a
+unique `volumeHandle`, following the
 [driver's own static provisioning example](https://github.com/kubernetes-csi/csi-driver-nfs/blob/master/deploy/example/README.md#pvpvc-usage-static-provisioning),
-then apply both:
+then bind a PVC to it with `volumeName`. Set `storageClassName: ""` on both
+the PV and PVC if no StorageClass should be used. Preserve existing volume
+handles, export paths, and bindings when bringing resources under management.
+After applying your workload's PV/PVC definitions, check their status:
 
 ```bash
-kubectl apply -f manifests/nfs-csi/examples/pv-static.yaml
-kubectl apply -f manifests/nfs-csi/examples/pvc-static.yaml
-kubectl get pv,pvc
+kubectl get pv
+kubectl get pvc -A
 ```
 
 `STATUS` should read `Bound` for both once the claim picks up the volume.
