@@ -5,6 +5,10 @@
   gather_facts: false
 
   roles:
+    - role: nfs_csi
+      tags:
+        - nfs_csi
+
     - cert_manager
     - cloudflare
     - cluster_issuer

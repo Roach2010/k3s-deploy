@@ -1,0 +1,12 @@
+---
+nfs_csi_version: v4.13.4
+nfs_csi_wait_timeout: 300
+
+nfs_csi_manifest_base_url: >-
+  https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/{{ nfs_csi_version }}/deploy/{{ nfs_csi_version }}
+
+nfs_csi_manifests:
+  - rbac-csi-nfs.yaml
+  - csi-nfs-driverinfo.yaml
+  - csi-nfs-controller.yaml
+  - csi-nfs-node.yaml

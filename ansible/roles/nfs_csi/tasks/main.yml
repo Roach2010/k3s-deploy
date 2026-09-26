@@ -1,0 +1,45 @@
+---
+- name: Apply NFS CSI driver manifests
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    src: "{{ nfs_csi_manifest_base_url }}/{{ item }}"
+  loop: "{{ nfs_csi_manifests }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Wait for NFS CSI controller and node plugin
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    namespace: kube-system
+    name: "{{ item.name }}"
+    wait: true
+    wait_sleep: 5
+    wait_timeout: "{{ nfs_csi_wait_timeout }}"
+  loop:
+    - kind: Deployment
+      name: csi-nfs-controller
+    - kind: DaemonSet
+      name: csi-nfs-node
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Read NFS CSI driver registration
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: CSIDriver
+    name: nfs.csi.k8s.io
+  register: nfs_csi_registration
+  when: not ansible_check_mode
+
+- name: Verify NFS CSI driver is registered
+  ansible.builtin.assert:
+    that:
+      - nfs_csi_registration.resources | length == 1
+    fail_msg: "The nfs.csi.k8s.io driver is not registered."
+  when: not ansible_check_mode
