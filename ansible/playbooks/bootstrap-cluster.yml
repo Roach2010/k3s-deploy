@@ -5,6 +5,10 @@
   gather_facts: false
 
   roles:
+    - role: synology_csi
+      tags:
+        - synology_csi
+
     - role: nfs_csi
       tags:
         - nfs_csi

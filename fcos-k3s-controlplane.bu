@@ -229,6 +229,12 @@ storage:
 
 systemd:
   units:
+    - name: iscsid.service
+      enabled: true
+
+    - name: iscsi-init.service
+      enabled: true
+
     - name: k3s-server-install.service
       enabled: true
       contents: |

@@ -1,0 +1,28 @@
+---
+synology_csi_version: v1.3.1
+synology_csi_namespace: synology-csi
+synology_csi_wait_timeout: 300
+
+# The NAS address is deliberately configurable because it is part of the
+# user's LAN, not a property of the Kubernetes cluster.
+synology_csi_dsm_host: ""
+synology_csi_dsm_port: 5001
+synology_csi_dsm_https: true
+synology_csi_dsm_tls_ca_cert: ""
+synology_csi_dsm_tls_server_name: ""
+synology_csi_dsm_insecure_skip_verify: false
+
+synology_csi_storage_class: synology-iscsi-storage
+synology_csi_storage_location: /volume1
+synology_csi_storage_fs_type: ext4
+synology_csi_storage_reclaim_policy: Retain
+synology_csi_storage_volume_binding_mode: WaitForFirstConsumer
+synology_csi_storage_allow_volume_expansion: true
+synology_csi_enable_fua_sync_cache: true
+
+synology_csi_manifest_base_url: >-
+  https://raw.githubusercontent.com/SynologyOpenSource/synology-csi/{{ synology_csi_version }}/deploy/kubernetes/v1.20
+synology_csi_manifests:
+  - namespace.yml
+  - controller.yml
+  - node.yml

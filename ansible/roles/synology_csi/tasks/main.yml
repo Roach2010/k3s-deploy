@@ -1,0 +1,211 @@
+---
+- name: Validate Synology CSI settings
+  ansible.builtin.assert:
+    that:
+      - synology_csi_dsm_host | length > 0
+      - synology_csi_dsm_username | default('') | length > 0
+      - synology_csi_dsm_password | default('') | length > 0
+      - synology_csi_storage_location is match('^/[^/].*')
+      - synology_csi_dsm_insecure_skip_verify | bool == false
+    fail_msg: >-
+      Set the Synology CSI DSM host, username, and password in inventory (the
+      password belongs in vault.yml), and provide a DSM volume such as
+      /volume1. Use tlsCACert for a self-signed DSM certificate instead of
+      disabling TLS verification.
+
+- name: Create Synology CSI namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    src: "{{ synology_csi_manifest_base_url }}/namespace.yml"
+
+- name: Create Synology CSI client-info secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: client-info-secret
+        namespace: "{{ synology_csi_namespace }}"
+      type: Opaque
+      stringData:
+        client-info.yml: |
+          {{ {
+            'clients': [{
+              'host': synology_csi_dsm_host,
+              'port': synology_csi_dsm_port,
+              'https': synology_csi_dsm_https,
+              'username': synology_csi_dsm_username,
+              'password': synology_csi_dsm_password,
+              'tlsCACert': synology_csi_dsm_tls_ca_cert,
+              'tlsServerName': synology_csi_dsm_tls_server_name,
+              'insecureSkipVerify': synology_csi_dsm_insecure_skip_verify
+            }]
+          } | to_nice_yaml(indent=2, width=1000) }}
+  no_log: true
+
+- name: Apply pinned Synology CSI manifests
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    src: "{{ synology_csi_manifest_base_url }}/{{ item }}"
+  loop: "{{ synology_csi_manifests | reject('equalto', 'namespace.yml') | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Apply Synology CSI driver registration without unsupported attach calls
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: CSIDriver
+      metadata:
+        name: csi.san.synology.com
+      spec:
+        # Synology CSI 1.4.0 does not implement ControllerPublishVolume or
+        # ControllerUnpublishVolume, so the external-attacher must not call it.
+        attachRequired: false
+        podInfoOnMount: true
+        volumeLifecycleModes:
+          - Persistent
+
+- name: Apply Synology iSCSI StorageClass
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ synology_csi_storage_class }}"
+      provisioner: csi.san.synology.com
+      parameters:
+        protocol: iscsi
+        dsm: "{{ synology_csi_dsm_host }}"
+        location: "{{ synology_csi_storage_location }}"
+        fsType: "{{ synology_csi_storage_fs_type }}"
+        enableFuaSyncCache: "{{ synology_csi_enable_fua_sync_cache | ternary('true', 'false') }}"
+      reclaimPolicy: "{{ synology_csi_storage_reclaim_policy }}"
+      allowVolumeExpansion: "{{ synology_csi_storage_allow_volume_expansion }}"
+      volumeBindingMode: "{{ synology_csi_storage_volume_binding_mode }}"
+
+- name: Restart CSI workloads when DSM client credentials change
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    merge_type:
+      - strategic-merge
+    definition:
+      apiVersion: "{{ item.api_version }}"
+      kind: "{{ item.kind }}"
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ synology_csi_namespace }}"
+      spec:
+        template:
+          metadata:
+            annotations:
+              synology.csi.san.synology.com/client-info-version: "{{ (synology_csi_dsm_host ~ synology_csi_dsm_username ~ synology_csi_dsm_password) | hash('sha256') }}"
+  loop:
+    - api_version: apps/v1
+      kind: StatefulSet
+      name: synology-csi-controller
+    - api_version: apps/v1
+      kind: DaemonSet
+      name: synology-csi-node
+
+- name: Run the controller plugin as root for its CSI socket
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: synology-csi-controller
+        namespace: "{{ synology_csi_namespace }}"
+      spec:
+        template:
+          spec:
+            containers:
+              - name: csi-plugin
+                securityContext:
+                  runAsUser: 0
+    merge_type:
+      - strategic-merge
+
+- name: Use an absolute Unix socket path in the node plugin
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: synology-csi-node
+        namespace: "{{ synology_csi_namespace }}"
+      spec:
+        template:
+          spec:
+            containers:
+              - name: csi-plugin
+                env:
+                  - name: CSI_ENDPOINT
+                    value: unix:///csi/csi.sock
+    merge_type:
+      - strategic-merge
+
+- name: Wait for Synology CSI controller
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: StatefulSet
+    namespace: "{{ synology_csi_namespace }}"
+    name: synology-csi-controller
+  register: synology_csi_controller
+  until:
+    - synology_csi_controller.resources | length == 1
+    - synology_csi_controller.resources[0].status.readyReplicas | default(0) | int == 1
+  retries: "{{ (synology_csi_wait_timeout / 5) | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Wait for Synology CSI node plugins
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    namespace: "{{ synology_csi_namespace }}"
+    name: synology-csi-node
+  register: synology_csi_node
+  until:
+    - synology_csi_node.resources | length == 1
+    - synology_csi_node.resources[0].status.numberReady | default(0) | int == synology_csi_node.resources[0].status.desiredNumberScheduled | default(0) | int
+    - synology_csi_node.resources[0].status.desiredNumberScheduled | default(0) | int > 0
+  retries: "{{ (synology_csi_wait_timeout / 5) | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Verify Synology CSI driver registration
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: CSIDriver
+    name: csi.san.synology.com
+  register: synology_csi_registration
+  when: not ansible_check_mode
+
+- name: Verify Synology CSI driver is registered without attachment
+  ansible.builtin.assert:
+    that:
+      - synology_csi_registration.resources | length == 1
+      - not synology_csi_registration.resources[0].spec.attachRequired | bool
+    fail_msg: The Synology CSI driver registration is missing or still requires unsupported attachment calls.
+  when: not ansible_check_mode

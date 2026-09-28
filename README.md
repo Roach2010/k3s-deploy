@@ -53,7 +53,7 @@ Before running scripts, it helps to understand what is happening under the hood.
 *   **k3s**: A lightweight Kubernetes distribution packaged as a single binary. 
     *   **Control Plane (`k3s server`)**: Hosts the API server, scheduler, controller manager, and datastore (SQLite or Etcd).
     *   **Worker (`k3s agent`)**: Runs the `kubelet` and container runtime to execute your workload containers.
-*   **Ansible**: Runs on your management machine and configures cluster services through the Kubernetes API. Butane/Ignition manages the nodes; Ansible manages the NFS CSI Kubernetes resources after node provisioning.
+*   **Ansible**: Runs on your management machine and configures cluster services through the Kubernetes API. Butane/Ignition manages the nodes; Ansible manages the Synology and NFS CSI Kubernetes resources after node provisioning.
 
 ---
 
@@ -78,6 +78,7 @@ Before running scripts, it helps to understand what is happening under the hood.
 │   │   ├── bootstrap-cluster.yml # Installs cluster services
 │   │   └── test-kubernetes.yml
 │   └── roles/
+│       ├── synology_csi/      # Synology SAN Manager iSCSI CSI driver
 │       ├── nfs_csi/           # Versioned NFS CSI manifests and readiness checks
 │       ├── cert_manager/      # cert-manager Helm release
 │       ├── cloudflare/        # Cloudflare API token Secret
@@ -172,6 +173,9 @@ Cluster service settings live separately in `ansible/inventory/group_vars/all/va
 | `letsencrypt_email` | Contact email for the Let's Encrypt accounts. |
 | `nfs_csi_version` | Optional override of the NFS CSI role default, currently `v4.13.4`. |
 | `nfs_csi_wait_timeout` | Optional override of the driver readiness timeout, currently 300 seconds per resource. |
+| `synology_csi_dsm_host` | Synology DSM address used by SAN Manager. |
+| `synology_csi_dsm_username` | Dedicated DSM user for CSI; keep its password in encrypted `vault.yml`. |
+| `synology_csi_storage_location` | DSM volume for dynamically provisioned iSCSI LUNs, currently `/volume1`. |
 
 Keep `vault_cloudflare_api_token` in the encrypted `ansible/inventory/group_vars/all/vault.yml`. The Ansible configuration reads the Vault password from `~/.ansible/.vault_pass`.
 
@@ -496,6 +500,50 @@ kubectl get pvc -A
 ```
 
 `STATUS` should read `Bound` for both once the claim picks up the volume.
+
+### Setting Up Synology CSI iSCSI Storage
+
+The Ansible `synology_csi` role installs Synology CSI `v1.4.0` for a Synology
+NAS with SAN Manager. It creates the `synology-csi` namespace, the DSM client
+secret, the CSI controller and node plugin, and the `synology-iscsi-storage`
+StorageClass. The class provisions iSCSI LUNs on `/volume1`, uses `ext4`, waits
+for the first consumer, allows expansion, and keeps deleted volumes with
+`Retain`. It is not made the cluster default; `local-path` remains available
+for workloads that do not need shared block storage.
+
+FCOS already provides the iSCSI initiator tools. Both Butane templates enable
+`iscsi-init.service` and `iscsid.service`; no NFS package, NFS mount, or
+additional host layering is needed for Synology CSI. Every node that may run a
+PVC workload must have network access to the NAS's iSCSI port (3260) and DSM
+HTTPS port (5001).
+
+Create a dedicated DSM user in the administrators group, allow it to access
+DSM, and put its password in the encrypted vault. Then run the role from
+`ansible/`:
+
+```bash
+ansible-vault edit inventory/group_vars/all/vault.yml
+# add: synology_csi_dsm_password: <the DSM CSI user's password>
+ansible-playbook playbooks/bootstrap-cluster.yml --syntax-check
+ansible-playbook playbooks/bootstrap-cluster.yml --tags synology_csi
+```
+
+The role pins the upstream manifests and verifies that the controller and node
+DaemonSet are ready. It registers the driver with `attachRequired: false`
+because Synology CSI `v1.4.0` does not implement controller-side publish and
+unpublish calls. Before using this class for application data, create a small
+PVC and pod and confirm the volume appears in DSM and mounts successfully:
+
+```bash
+kubectl get csidriver csi.san.synology.com
+kubectl get pods -n synology-csi -o wide
+kubectl get storageclass synology-iscsi-storage
+```
+
+The driver can reconnect a volume on another node after a failure, but it does
+not fence a node that still has an iSCSI session. Confirm the failed node is
+powered off or otherwise fenced before forcing a single-writer workload to
+another node. Keep backups of application data outside the Synology volume.
 
 ---
 

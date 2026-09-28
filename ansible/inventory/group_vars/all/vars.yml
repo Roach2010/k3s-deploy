@@ -1,8 +1,7 @@
 ---
 kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/config"
 
-domain: compvirt.com
-
-cert_manager_version: v1.21.2
-
-letsencrypt_email: "donald.munn@gmail.com"
+# Optional version overrides. Uncomment to override the role defaults.
+# cert_manager_version: v1.21.2
+# nfs_csi_version: v4.13.4
+# synology_csi_version: v1.3.1
