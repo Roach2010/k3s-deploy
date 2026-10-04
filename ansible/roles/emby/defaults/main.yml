@@ -1,0 +1,31 @@
+---
+# Select a pinned official Emby image tag.
+emby_version: "4.10.1.0"
+emby_image: emby/embyserver
+emby_namespace: emby
+emby_hostname: "emby.{{ domain }}"
+emby_config_claim: emby-config-iscsi
+emby_config_storage_class: synology-iscsi-storage
+emby_config_storage_size: 10Gi
+emby_media_manage: true
+emby_media_claim: emby-media
+emby_media_pv: "{{ emby_namespace }}-media-nfs"
+emby_media_nfs_server: "{{ synology_csi_dsm_host }}"
+# Set the private export path in inventory/group_vars/all/vault.yml.
+emby_media_nfs_share: ""
+emby_media_capacity: 10Ti
+emby_media_mount_options: [nfsvers=4.1]
+emby_media_mount_path: /media
+emby_media_read_only: true
+# Numeric IDs with access to the NAS media files.
+emby_uid: "1024"
+emby_gid: "100"
+emby_gidlist: "{{ emby_gid }}"
+emby_cluster_issuer: letsencrypt-production
+emby_wait_timeout: 300
+# Set the dedicated LAN endpoint in inventory/group_vars/all/vault.yml.
+emby_service_ip: ""
+emby_load_balancer_class: metallb.io/metallb
+emby_metallb_namespace: metallb-system
+emby_proxy_image: nginx
+emby_proxy_version: "1.28.3-alpine"

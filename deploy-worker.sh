@@ -13,22 +13,47 @@ step() {
 }
 
 # --- Argument parsing ----------------------------------------------------
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <hostname>"
+usage() {
+  echo "Usage: $0 <hostname> [--cpus <count>] [--memory-mb <MiB>]"
+  echo "Defaults: WORKER_CPUS and WORKER_MEMORY_MB in deploy.env; blank keeps OVA sizing."
+}
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 1 || "$1" == -* ]]; then
+  usage
   exit 1
 fi
 VM_NAME=$1
 shift
 
+WORKER_CPUS_OVERRIDE=""
+WORKER_MEMORY_MB_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cpus|--memory-mb)
+      if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$1 requires a positive integer (memory is in MiB)." >&2
+        exit 1
+      fi
+      case "$1" in
+        --cpus) WORKER_CPUS_OVERRIDE=$2 ;;
+        --memory-mb) WORKER_MEMORY_MB_OVERRIDE=$2 ;;
+      esac
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
     --cluster-init|-c|--join|-j)
       echo "--cluster-init/-c and --join/-j only apply to deploy-controlplane.sh, not workers."
       exit 1
       ;;
     *)
       echo "Unknown argument: $1"
-      echo "Usage: $0 <hostname>"
+      usage
       exit 1
       ;;
   esac
@@ -62,6 +87,24 @@ for v in "${REQUIRED_VARS[@]}"; do
     exit 1
   fi
 done
+# Explicit per-worker flags take precedence over deploy.env defaults.
+WORKER_CPUS="${WORKER_CPUS_OVERRIDE:-${WORKER_CPUS:-}}"
+WORKER_MEMORY_MB="${WORKER_MEMORY_MB_OVERRIDE:-${WORKER_MEMORY_MB:-}}"
+WORKER_HARDWARE_ARGS=()
+for v in WORKER_CPUS WORKER_MEMORY_MB; do
+  if [[ -n "${!v}" && ! "${!v}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${v} must be a positive integer or blank to keep OVA sizing." >&2
+    exit 1
+  fi
+done
+if [[ -n "${WORKER_CPUS}" ]]; then
+  WORKER_HARDWARE_ARGS+=(-c "${WORKER_CPUS}")
+fi
+if [[ -n "${WORKER_MEMORY_MB}" ]]; then
+  WORKER_HARDWARE_ARGS+=(-m "${WORKER_MEMORY_MB}")
+fi
+echo "Worker sizing: CPUs=${WORKER_CPUS:-OVA default}, memory=${WORKER_MEMORY_MB:-OVA default} (MiB)."
+
 export GOVC_URL GOVC_USERNAME GOVC_PASSWORD GOVC_INSECURE
 echo "All required variables present."
 
@@ -216,8 +259,8 @@ VM_MAC=$(govc vm.info -json "${VM_NAME}" \
 echo "If you want a fixed IP for ${VM_NAME}, add a DHCP reservation for ${VM_MAC} now."
 
 # --- Inject Ignition and power on -----------------------------------------
-step "Injecting Ignition config and powering on"
-govc vm.change -vm "${VM_NAME}" \
+step "Applying worker sizing, injecting Ignition config and powering on"
+govc vm.change -vm "${VM_NAME}" "${WORKER_HARDWARE_ARGS[@]}" \
   -e "guestinfo.ignition.config.data.encoding=${CONFIG_ENCODING}" \
   -e "guestinfo.ignition.config.data=${CONFIG_ENCODED}"
 govc vm.power -on "${VM_NAME}"

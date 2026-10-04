@@ -5,6 +5,9 @@
   gather_facts: false
 
   roles:
+    - role: metallb
+      tags: [metallb]
+
     - role: synology_csi
       tags:
         - synology_csi

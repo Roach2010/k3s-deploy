@@ -1,0 +1,5 @@
+---
+metallb_version: "0.16.1"
+metallb_namespace: metallb-system
+metallb_load_balancer_class: metallb.io/metallb
+metallb_wait_timeout: 300

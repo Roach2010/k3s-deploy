@@ -1,0 +1,147 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: emby-proxy
+  namespace: {{ emby_namespace | to_json }}
+data:
+  nginx.conf: {{ lookup('template', 'proxy.conf.j2') | to_json }}
+  start.sh: {{ lookup('template', 'proxy-start.sh.j2') | to_json }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: emby-headless
+  namespace: {{ emby_namespace | to_json }}
+spec:
+  clusterIP: None
+  selector:
+    app: emby
+  ports:
+    - name: http
+      port: 8096
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: emby
+  namespace: {{ emby_namespace | to_json }}
+spec:
+  replicas: 1
+  serviceName: emby-headless
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: emby
+  template:
+    metadata:
+      annotations:
+        checksum/proxy: {{ ((lookup('template', 'proxy.conf.j2') ~ lookup('template', 'proxy-start.sh.j2')) | hash('sha256')) | to_json }}
+      labels:
+        app: emby
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: node.kubernetes.io/exclude-from-external-load-balancers
+                    operator: DoesNotExist
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: emby
+          image: {{ (emby_image ~ ':' ~ emby_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: UID
+              value: {{ emby_uid | string | to_json }}
+            - name: GID
+              value: {{ emby_gid | string | to_json }}
+            - name: GIDLIST
+              value: {{ emby_gidlist | string | to_json }}
+          ports:
+            - name: http
+              containerPort: 8096
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: media
+              mountPath: {{ emby_media_mount_path | to_json }}
+              readOnly: {{ emby_media_read_only | bool | to_json }}
+        - name: https-proxy
+          image: {{ (emby_proxy_image ~ ':' ~ emby_proxy_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, /proxy/start.sh]
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: proxy
+              mountPath: /proxy
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: proxy
+          configMap:
+            name: emby-proxy
+        - name: tls
+          secret:
+            secretName: emby-tls
+        - name: config
+          persistentVolumeClaim:
+            claimName: {{ emby_config_claim | to_json }}
+        - name: media
+          persistentVolumeClaim:
+            claimName: {{ emby_media_claim | to_json }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: emby
+  namespace: {{ emby_namespace | to_json }}
+  labels:
+    app: emby
+  annotations:
+    metallb.io/address-pool: emby
+    metallb.io/loadBalancerIPs: {{ emby_service_ip | to_json }}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: {{ emby_load_balancer_class | to_json }}
+  externalTrafficPolicy: Local
+  selector:
+    app: emby
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

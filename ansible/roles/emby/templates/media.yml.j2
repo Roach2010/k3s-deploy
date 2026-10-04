@@ -1,0 +1,36 @@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ emby_media_pv | to_json }}
+spec:
+  capacity:
+    storage: {{ emby_media_capacity | to_json }}
+  accessModes: [ReadWriteMany]
+  volumeMode: Filesystem
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ emby_namespace | to_json }}
+    name: {{ emby_media_claim | to_json }}
+  mountOptions: {{ emby_media_mount_options | to_json }}
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: {{ emby_media_pv | to_json }}
+    volumeAttributes:
+      server: {{ emby_media_nfs_server | to_json }}
+      share: {{ emby_media_nfs_share | to_json }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ emby_media_claim | to_json }}
+  namespace: {{ emby_namespace | to_json }}
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Filesystem
+  storageClassName: ""
+  volumeName: {{ emby_media_pv | to_json }}
+  resources:
+    requests:
+      storage: {{ emby_media_capacity | to_json }}

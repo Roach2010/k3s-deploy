@@ -8,7 +8,7 @@ If you already know your way around Linux (`systemctl`, `journalctl`, system net
 
 ## 1. Core Architecture & Concepts
 
-Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping. Once the nodes are ready, Ansible installs the cluster services: the NFS CSI driver, cert-manager, the Cloudflare API token Secret, and Let's Encrypt ClusterIssuers.
+Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping. Once the nodes are ready, Ansible installs the cluster services: MetalLB, the Synology and NFS CSI drivers, cert-manager, the Cloudflare API token Secret, and Let's Encrypt ClusterIssuers. Separate application playbooks deploy workloads such as Emby after those services are ready.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -76,14 +76,19 @@ Before running scripts, it helps to understand what is happening under the hood.
 │   │   └── group_vars/all/    # Cluster variables and encrypted Vault secrets
 │   ├── playbooks/
 │   │   ├── bootstrap-cluster.yml # Installs cluster services
-│   │   └── test-kubernetes.yml
+│   │   ├── test-kubernetes.yml
+│   │   └── applications/
+│   │       ├── emby.yml      # Emby application deployment
+│   │       └── headscale.yml  # Headscale application deployment
 │   └── roles/
 │       ├── synology_csi/      # Synology SAN Manager iSCSI CSI driver
 │       ├── nfs_csi/           # Versioned NFS CSI manifests and readiness checks
 │       ├── cert_manager/      # cert-manager Helm release
 │       ├── cloudflare/        # Cloudflare API token Secret
 │       ├── cluster_issuer/    # Let's Encrypt staging and production issuers
-│       └── certificate_test/
+│       ├── certificate_test/
+│       ├── emby/             # StatefulSet, iSCSI config, NFS media, and local HTTPS
+│       └── headscale/         # Headscale, persistent data, and HTTPS ingress
 ├── .gitignore                 # Prevents secrets, cache, and rendered output from hitting Git
 ├── rendered/                  # Transient output directory for compiled .ign files (Git-ignored)
 └── ova/                       # Local cache directory for downloaded FCOS binaries (Git-ignored)
@@ -144,6 +149,8 @@ Open `deploy.env` in your text editor and configure your environment settings:
 | `NETWORK` | vSphere Portgroup to attach the node NIC. |
 | `FCOS_STREAM` | Release channel (`stable`, `testing`, or `next`). Defaults to `stable`. |
 | `FCOS_OVA` | *(Optional)* Absolute path to an OVA file on disk if you want to bypass dynamic downloads. |
+| `WORKER_CPUS` | Optional default worker vCPU count; blank preserves the OVA default. |
+| `WORKER_MEMORY_MB` | Optional default worker memory in MiB; blank preserves the OVA default. |
 | `VM_FOLDER` | vCenter VM inventory folder path (e.g., `/Datacenter/vm/k3s`). |
 | `DOMAIN_SUFFIX` | Domain name appended to hostnames (e.g., `cluster.local`). |
 | `SSH_PUBLIC_KEY_1` | Your SSH public key (added to the `core` user on the node). |
@@ -169,11 +176,9 @@ Cluster service settings live separately in `ansible/inventory/group_vars/all/va
 | :--- | :--- |
 | `kubeconfig` | Path to the Kubernetes credentials on the Ansible machine. Defaults to `~/.kube/config`. |
 | `domain` | DNS zone used for certificate requests. |
-| `cert_manager_version` | Pinned cert-manager Helm chart version. |
 | `letsencrypt_email` | Contact email for the Let's Encrypt accounts. |
-| `nfs_csi_version` | Optional override of the NFS CSI role default, currently `v4.13.4`. |
 | `nfs_csi_wait_timeout` | Optional override of the driver readiness timeout, currently 300 seconds per resource. |
-| `synology_csi_dsm_host` | Synology DSM address used by SAN Manager. |
+| `synology_csi_dsm_host` | Synology DSM address used by SAN Manager, currently `192.168.20.5`. |
 | `synology_csi_dsm_username` | Dedicated DSM user for CSI; keep its password in encrypted `vault.yml`. |
 | `synology_csi_storage_location` | DSM volume for dynamically provisioned iSCSI LUNs, currently `/volume1`. |
 
@@ -302,6 +307,43 @@ Worker nodes run workloads and report back to the control plane. Pass a unique h
 ./deploy-worker.sh k3s-worker2
 ```
 
+#### Choosing Worker CPU and Memory Sizes
+
+Set shared worker defaults in `deploy.env`, for example:
+
+```bash
+WORKER_CPUS='4'
+WORKER_MEMORY_MB='8192'
+```
+
+These settings give new workers 4 vCPUs and 8 GiB of memory. Override either
+setting for an individual worker on the command line:
+
+```bash
+./deploy-worker.sh k3s-worker1
+./deploy-worker.sh k3s-worker2 --cpus 8 --memory-mb 16384
+```
+
+Command-line values take precedence over `deploy.env`. Values must be
+positive integers; memory uses MiB, so 16384 means 16 GiB. Leave either
+configuration variable blank to retain that resource's OVA default.
+The script validates sizing before downloading or importing the OVA, then
+applies it with `govc vm.change` while the imported VM is powered off.
+
+These options apply to new worker VMs. They do not resize existing nodes or
+change control-plane sizing. `inject-worker.sh` only injects configuration;
+size an existing VM separately in vSphere before booting it.
+
+After a worker joins, inspect the resources reported to Kubernetes:
+
+```bash
+kubectl describe node <worker-fqdn>
+```
+
+The `Capacity` and `Allocatable` sections show the node's resources and the
+portion available for scheduling. Pod resource requests and limits are
+configured separately in application manifests.
+
 ### Re-injecting Config Into an Already-Existing VM
 
 `inject-controlplane.sh` and `inject-worker.sh` do the same Butane
@@ -316,9 +358,9 @@ Ignition config:
 ./inject-worker.sh k3s-worker1
 ```
 
-They take the same role-specific flags as their `deploy-*.sh`
+They take the cluster bootstrap flags from their `deploy-*.sh`
 counterparts (`--cluster-init`/`-c`, `--join`/`-j`, `--node`/`-n`,
-`--wait-for-reservation`/`-w` for control-plane; none for workers), plus
+`--wait-for-reservation`/`-w` for control-plane; no cluster-init/join flags for workers), plus
 one new one: `--power-on`/`-p`. **Neither script powers the VM on by
 default** - injection only, unless you pass that flag.
 
@@ -404,8 +446,8 @@ to your credentials file. Its default is `~/.kube/config`; exporting
 Run the playbook from `ansible/` so its configuration, inventory, and role
 paths are used.
 
-Bootstrap runs `nfs_csi`, `cert_manager`, `cloudflare`, and `cluster_issuer`
-in that order. The NFS role uses `kubernetes.core.k8s` with `apply: true`,
+Bootstrap runs `metallb`, `synology_csi`, `nfs_csi`, `cert_manager`,
+`cloudflare`, and `cluster_issuer` in that order. The NFS role uses `kubernetes.core.k8s` with `apply: true`,
 so repeated runs reconcile the same objects. It waits up to 300 seconds each
 for the controller Deployment and node DaemonSet, then checks the driver
 registration. Failed applies or readiness timeouts stop the playbook.
@@ -422,8 +464,9 @@ The default version is `v4.13.4`, configured in
 This transfers management to Ansible without changing the driver version.
 Keep the existing driver and PVs/PVCs in place; this handover does not require
 uninstalling them or adopting a Helm release. Existing nodes do not need to
-rerun Ignition. Future version changes can be set through `nfs_csi_version`
-in inventory variables.
+rerun Ignition. Set future version changes through `nfs_csi_version` in
+`roles/nfs_csi/defaults/main.yml`. Keep each role's version pin in its own
+defaults file rather than duplicating it in inventory variables.
 
 Confirm the driver installed:
 
@@ -544,6 +587,125 @@ The driver can reconnect a volume on another node after a failure, but it does
 not fence a node that still has an iSCSI session. Confirm the failed node is
 powered off or otherwise fenced before forcing a single-writer workload to
 another node. Keep backups of application data outside the Synology volume.
+
+---
+
+### Deploying Emby
+
+Emby is deployed separately from cluster bootstrap as a single-replica
+**StatefulSet**. The application role creates the `emby` namespace, storage
+claims, the `emby-0` pod, a headless Service, and a dedicated LoadBalancer
+Service at **<emby-service-ip>**. An NGINX HTTPS proxy runs in the same pod as
+Emby, using a certificate from the Let's Encrypt production issuer.
+
+```
+Client -> <emby-service-ip>:443 -> Emby worker -> NGINX -> localhost:8096 -> Emby
+```
+
+MetalLB advertises the service IP from the worker with the ready Emby pod.
+`externalTrafficPolicy: Local` keeps incoming traffic on that worker. The
+StatefulSet can move between workers; DNS and the client IP remain unchanged.
+Rescheduling interrupts streams while storage reconnects and the pod starts.
+
+*   **Config (`/config`)**: A `ReadWriteOnce` claim backed by the
+    `synology-iscsi-storage` class stores Emby's database and configuration on
+    a Synology iSCSI LUN.
+*   **Media (`/media`)**: The role creates a static NFS PV and PVC using
+    `nfs.csi.k8s.io`. You provide the NAS export; no pre-existing media claim
+    or NFS StorageClass is needed. Media is mounted read-only by default.
+
+After completing cluster bootstrap, enable NFSv4.1 on the Synology and allow
+all eligible K3s nodes to access the media export. Reserve `<emby-service-ip>` outside DHCP and leave it unassigned to any machine.
+Point LAN DNS for `emby.<your-domain>` at that address. All eligible workers
+must share its layer-2 network, allow TCP 443 from clients, and allow TCP/UDP
+7946 between MetalLB speakers. Use at least two workers to support movement.
+
+MetalLB uses the explicit `metallb.io/metallb` load-balancer class. K3s
+ServiceLB continues managing unclassified services such as shared Traefik;
+Emby's traffic uses its dedicated service. No Butane changes are needed.
+See the [MetalLB role guide](ansible/roles/metallb/README.md) for network
+requirements. On an already bootstrapped cluster, install MetalLB from `ansible/`:
+
+```bash
+ansible-playbook playbooks/bootstrap-cluster.yml --tags metallb
+```
+
+From `ansible/`, edit the role's settings:
+
+```bash
+${EDITOR:-vi} roles/emby/defaults/main.yml
+```
+
+Set `emby_version` to a pinned official image tag and `emby_uid`/`emby_gid`
+to numeric IDs with permission to read your media. Review the config volume
+size and hostname there too. Keep these public settings in the role defaults.
+Store the private media export path and service IP in encrypted Vault alongside `domain`
+and `synology_csi_dsm_host`:
+
+```bash
+ansible-vault edit inventory/group_vars/all/vault.yml
+```
+
+Add or update these keys using the DSM export path and your reserved LAN IP:
+
+```yaml
+emby_media_nfs_share: "/volume1/<media-export>"
+emby_service_ip: "<emby-service-ip>"
+```
+
+Leave `emby_media_nfs_share` and `emby_service_ip` empty in the role defaults;
+Vault supplies their values.
+The NFS server defaults to `synology_csi_dsm_host`, so both storage types use
+the same NAS address.
+
+Deploy the application:
+
+```bash
+ansible-playbook playbooks/applications/emby.yml --syntax-check
+ansible-playbook playbooks/applications/emby.yml
+```
+
+The config claim can remain `Pending` until the pod is scheduled because the
+Synology StorageClass uses `WaitForFirstConsumer`. The role waits for the
+StatefulSet and TLS certificate to become ready. Verify the result:
+
+```bash
+kubectl get statefulset,pods,pvc,svc -n emby
+kubectl get certificate -n emby
+kubectl logs emby-0 -n emby -c emby
+```
+
+Open `https://emby.<your-domain>` and complete the first-run wizard. Add media
+libraries using paths beneath `/media`. Keep the StatefulSet at one replica
+because it uses a single config claim. Back up the config data; NAS storage
+surviving a node loss does not replace backups.
+
+See the [Emby role guide](ansible/roles/emby/README.md) for the full Ansible
+and Kubernetes lesson, NAS permissions, storage checks, troubleshooting, and
+maintenance commands.
+
+---
+
+### Deploying Headscale
+
+Headscale is deployed separately from cluster bootstrap. Its role uses the
+existing Traefik ingress and Let's Encrypt production issuer, with one
+Headscale replica and a persistent SQLite database.
+
+Before deploying, configure a resilient **block-storage** class through
+`headscale_storage_class` in the Ansible inventory. The role deliberately
+has no storage default: the database must survive a node failure, and SQLite
+WAL files must not live on the NFS share. Also configure public DNS and TCP
+443 forwarding for `headscale.compvirt.com`, using Cloudflare **DNS only**.
+
+From `ansible/`, after completing those prerequisites:
+
+```bash
+ansible-playbook playbooks/applications/headscale.yml
+```
+
+See the [Headscale role guide](ansible/roles/headscale/README.md) for storage
+requirements, DNS, client registration, verification, and backup instructions.
 
 ---
 

@@ -1,0 +1,229 @@
+---
+- name: Require the private Emby service address
+  ansible.builtin.assert:
+    that:
+      - emby_service_ip | default('') | length > 0
+    fail_msg: Set emby_service_ip in inventory/group_vars/all/vault.yml to the reserved LAN IPv4 address.
+
+- name: Inspect eligible Emby workers
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Node
+    label_selectors:
+      - "!node-role.kubernetes.io/control-plane"
+      - "!node-role.kubernetes.io/master"
+      - "!node.kubernetes.io/exclude-from-external-load-balancers"
+  register: emby_workers
+
+- name: Require at least one eligible worker
+  ansible.builtin.assert:
+    that:
+      - emby_workers.resources | length > 0
+    fail_msg: Emby requires a worker on the service IP LAN. Use at least two for rescheduling between workers.
+
+- name: Inspect MetalLB installation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ emby_metallb_namespace }}"
+    name: metallb-controller
+  register: emby_metallb
+
+- name: Require MetalLB cluster bootstrap
+  ansible.builtin.assert:
+    that:
+      - emby_metallb.resources | length == 1
+    fail_msg: Run bootstrap-cluster.yml --tags metallb before deploying Emby.
+
+- name: Prepare Emby storage
+  tags: [emby_storage]
+  block:
+    - name: Inspect Emby config StorageClass
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ emby_config_storage_class }}"
+      register: emby_storage_class
+
+    - name: Require Synology iSCSI storage
+      ansible.builtin.assert:
+        that:
+          - emby_storage_class.resources | length == 1
+          - emby_storage_class.resources[0].provisioner == 'csi.san.synology.com'
+          - emby_storage_class.resources[0].parameters.protocol | default('iscsi') == 'iscsi'
+        fail_msg: Run Synology CSI cluster bootstrap before preparing Emby storage.
+
+    - name: Create Emby namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ emby_namespace }}"
+
+    - name: Prepare managed NFS media storage
+      ansible.builtin.include_tasks: media.yml
+      when: emby_media_manage | bool
+
+    - name: Create Emby iSCSI config claim
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ emby_config_claim }}"
+            namespace: "{{ emby_namespace }}"
+          spec:
+            accessModes: [ReadWriteOnce]
+            volumeMode: Filesystem
+            storageClassName: "{{ emby_config_storage_class }}"
+            resources:
+              requests:
+                storage: "{{ emby_config_storage_size }}"
+
+- name: Validate Emby settings
+  ansible.builtin.assert:
+    that:
+      - emby_version | length > 0
+      - emby_version != 'latest'
+      - emby_media_claim | length > 0
+      - emby_uid | string is match('^[0-9]+$')
+      - emby_gid | string is match('^[0-9]+$')
+    fail_msg: >-
+      Set a pinned emby_version, NFS emby_media_claim and numeric
+      UID/GID with access to the media export.
+
+- name: Inspect Emby media claim
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ emby_namespace }}"
+    name: "{{ emby_media_claim }}"
+  register: emby_media_pvc
+  until:
+    - emby_media_pvc.resources | length == 1
+    - emby_media_pvc.resources[0].status.phase | default('') == 'Bound'
+  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Require an existing bound media claim
+  ansible.builtin.assert:
+    that:
+      - emby_media_pvc.resources | length == 1
+      - emby_media_pvc.resources[0].status.phase | default('') == 'Bound'
+    fail_msg: The media PVC must be Bound before deploying Emby.
+  when: not ansible_check_mode
+
+- name: Inspect Emby media volume
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ emby_media_pvc.resources[0].spec.volumeName }}"
+  register: emby_media_pv
+  when: not ansible_check_mode
+
+- name: Verify media uses NFS
+  ansible.builtin.assert:
+    that:
+      - emby_media_pv.resources | length == 1
+      - >-
+        emby_media_pv.resources[0].spec.nfs is defined or
+        (emby_media_pv.resources[0].spec.csi.driver | default('')) == 'nfs.csi.k8s.io'
+    fail_msg: The existing media volume must use NFS or nfs.csi.k8s.io.
+  when: not ansible_check_mode
+
+- name: Inspect existing Emby StatefulSet
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: StatefulSet
+    namespace: "{{ emby_namespace }}"
+    name: emby
+  register: emby_existing
+
+- name: Verify existing StatefulSet immutable settings are compatible
+  ansible.builtin.assert:
+    that:
+      - >-
+        emby_existing.resources[0].spec.selector == {'matchLabels': {'app': 'emby'}}
+      - emby_existing.resources[0].spec.serviceName == 'emby-headless'
+    fail_msg: Existing immutable selector differs; adapt the role template before applying it.
+  when: emby_existing.resources | length > 0
+
+- name: Configure Emby address advertisement and certificate
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'network.yml.j2') | from_yaml_all | list }}"
+  register: emby_network
+  until: emby_network is succeeded
+  retries: 12
+  delay: 5
+
+- name: Wait for Emby certificate
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ emby_namespace }}"
+    name: emby-tls
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ emby_wait_timeout }}"
+  when: not ansible_check_mode
+
+- name: Apply Emby StatefulSet, services and HTTPS proxy
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'resources.yml.j2') | from_yaml_all | list }}"
+
+- name: Wait for the current Emby StatefulSet revision
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: StatefulSet
+    namespace: "{{ emby_namespace }}"
+    name: emby
+  register: emby_statefulset
+  until:
+    - emby_statefulset.resources | length == 1
+    - emby_statefulset.resources[0].status.observedGeneration | default(0) | int >= emby_statefulset.resources[0].metadata.generation | int
+    - emby_statefulset.resources[0].status.readyReplicas | default(0) | int == 1
+    - emby_statefulset.resources[0].status.updatedReplicas | default(0) | int == 1
+    - emby_statefulset.resources[0].status.currentRevision | default('') | length > 0
+    - emby_statefulset.resources[0].status.currentRevision | default('') == emby_statefulset.resources[0].status.updateRevision | default('')
+  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Wait for Emby service IP allocation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Service
+    name: emby
+    namespace: "{{ emby_namespace }}"
+  register: emby_service
+  until:
+    - emby_service.resources | length == 1
+    - emby_service_ip in (emby_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip') | list)
+  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode

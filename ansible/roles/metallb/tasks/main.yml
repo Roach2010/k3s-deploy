@@ -1,0 +1,33 @@
+---
+- name: Create MetalLB namespace for privileged network speakers
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ metallb_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+
+- name: Install MetalLB for explicitly selected services
+  kubernetes.core.helm:
+    kubeconfig: "{{ kubeconfig }}"
+    name: metallb
+    chart_ref: metallb
+    chart_repo_url: https://metallb.github.io/metallb
+    chart_version: "{{ metallb_version }}"
+    release_namespace: "{{ metallb_namespace }}"
+    values:
+      loadBalancerClass: "{{ metallb_load_balancer_class }}"
+      frrk8s:
+        enabled: false
+      speaker:
+        frr:
+          enabled: false
+    state: present
+    wait: true
+    atomic: true
+    timeout: "{{ metallb_wait_timeout }}s"

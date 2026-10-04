@@ -1,0 +1,29 @@
+---
+- name: Validate NFS export settings
+  ansible.builtin.assert:
+    that:
+      - emby_media_nfs_server | length > 0
+      - emby_media_nfs_share is match('^/')
+      - emby_media_claim | length > 0
+    fail_msg: Set synology_csi_dsm_host in inventory and emby_media_nfs_share to the exported media directory. emby_media_nfs_server defaults to the DSM host.
+
+- name: Verify NFS CSI is installed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: CSIDriver
+    name: nfs.csi.k8s.io
+  register: emby_nfs_driver
+
+- name: Require the NFS CSI driver
+  ansible.builtin.assert:
+    that:
+      - emby_nfs_driver.resources | length == 1
+    fail_msg: Run the nfs_csi role in cluster bootstrap first.
+
+- name: Create static NFS media PV and PVC
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'media.yml.j2') | from_yaml_all | list }}"
