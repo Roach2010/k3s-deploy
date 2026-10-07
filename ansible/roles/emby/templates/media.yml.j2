@@ -13,7 +13,7 @@ spec:
   claimRef:
     namespace: {{ emby_namespace | to_json }}
     name: {{ emby_media_claim | to_json }}
-  mountOptions: {{ emby_media_mount_options | to_json }}
+  mountOptions: [nfsvers=4.1]
   csi:
     driver: nfs.csi.k8s.io
     volumeHandle: {{ emby_media_pv | to_json }}

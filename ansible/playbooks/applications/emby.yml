@@ -4,5 +4,10 @@
   connection: local
   gather_facts: false
 
+  # Every kubernetes.core module in the role uses this kubeconfig.
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+
   roles:
     - emby

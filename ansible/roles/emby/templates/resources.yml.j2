@@ -6,7 +6,6 @@ metadata:
   namespace: {{ emby_namespace | to_json }}
 data:
   nginx.conf: {{ lookup('template', 'proxy.conf.j2') | to_json }}
-  start.sh: {{ lookup('template', 'proxy-start.sh.j2') | to_json }}
 ---
 apiVersion: v1
 kind: Service
@@ -38,7 +37,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/proxy: {{ ((lookup('template', 'proxy.conf.j2') ~ lookup('template', 'proxy-start.sh.j2')) | hash('sha256')) | to_json }}
+        checksum/proxy: {{ lookup('template', 'proxy.conf.j2') | hash('sha256') | to_json }}
       labels:
         app: emby
     spec:
@@ -48,10 +47,6 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: node-role.kubernetes.io/control-plane
-                    operator: DoesNotExist
-                  - key: node-role.kubernetes.io/master
-                    operator: DoesNotExist
-                  - key: node.kubernetes.io/exclude-from-external-load-balancers
                     operator: DoesNotExist
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 120
@@ -65,7 +60,7 @@ spec:
             - name: GID
               value: {{ emby_gid | string | to_json }}
             - name: GIDLIST
-              value: {{ emby_gidlist | string | to_json }}
+              value: {{ emby_gid | string | to_json }}
           ports:
             - name: http
               containerPort: 8096
@@ -82,12 +77,14 @@ spec:
             - name: config
               mountPath: /config
             - name: media
-              mountPath: {{ emby_media_mount_path | to_json }}
+              mountPath: /media
               readOnly: {{ emby_media_read_only | bool | to_json }}
+            - name: transcode
+              mountPath: /transcode
         - name: https-proxy
           image: {{ (emby_proxy_image ~ ':' ~ emby_proxy_version) | to_json }}
           imagePullPolicy: IfNotPresent
-          command: [/bin/sh, /proxy/start.sh]
+          command: [nginx, -c, /proxy/nginx.conf, -g, "daemon off;"]
           ports:
             - name: https
               containerPort: 8443
@@ -124,6 +121,10 @@ spec:
         - name: media
           persistentVolumeClaim:
             claimName: {{ emby_media_claim | to_json }}
+        - name: transcode
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ emby_transcode_size | to_json }}
 ---
 apiVersion: v1
 kind: Service
@@ -137,7 +138,7 @@ metadata:
     metallb.io/loadBalancerIPs: {{ emby_service_ip | to_json }}
 spec:
   type: LoadBalancer
-  loadBalancerClass: {{ emby_load_balancer_class | to_json }}
+  loadBalancerClass: metallb.io/metallb
   externalTrafficPolicy: Local
   selector:
     app: emby

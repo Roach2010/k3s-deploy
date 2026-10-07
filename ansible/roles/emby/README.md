@@ -51,7 +51,7 @@ Browser -> <emby-service-ip>:443 -> Emby worker -> NGINX -> localhost:8096
 
 The config volume uses the `synology-iscsi-storage` class. The node mounts the
 block device as a filesystem; Emby sees normal files at `/config`. Media uses
-the NFS claim mounted at `/media` by default.
+the NFS claim mounted at `/media`.
 
 `ReadWriteOnce` allows writable mounting on one node, not necessarily one pod.
 This role uses a single StatefulSet replica and `RollingUpdate`: Kubernetes
@@ -75,7 +75,10 @@ playbooks/bootstrap-cluster.yml          # Shared cluster services
 playbooks/applications/emby.yml          # Calls this role
 roles/emby/defaults/main.yml             # Overridable settings
 roles/emby/tasks/main.yml                # Ordered tasks and validation
-roles/emby/templates/resources.yml.j2     # Kubernetes resources
+roles/emby/templates/media.yml.j2        # NFS media PV and PVC
+roles/emby/templates/network.yml.j2      # MetalLB pool, advertisement, Certificate
+roles/emby/templates/resources.yml.j2    # StatefulSet, Services, proxy ConfigMap
+roles/emby/templates/proxy.conf.j2       # NGINX configuration, reads the certificate on each handshake
 ```
 
 The application playbook is small:
@@ -87,9 +90,18 @@ The application playbook is small:
   connection: local
   gather_facts: false
 
+  # Every kubernetes.core module in the role uses this kubeconfig.
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+
   roles:
     - emby
 ```
+
+The role's tasks do not set `kubeconfig` themselves. If you call the role from
+another playbook, copy the `module_defaults` block, or the modules fall back to
+`KUBECONFIG` or `~/.kube/config`.
 
 Ansible automatically loads the role's tasks and defaults. Inventory variables
 override role defaults; command-line extra variables (`-e`) override inventory.
@@ -123,12 +135,13 @@ kubectl get nodes -o wide
 ```
 
 Confirm the context is the cluster you intend to change and the intended
-nodes are Ready. Server nodes can also run applications unless taints or other
-scheduling rules prevent it. This role does not configure GPU access.
+nodes are Ready. This role schedules Emby only on worker nodes: the pod's node
+affinity excludes nodes labelled `node-role.kubernetes.io/control-plane`. It
+does not configure GPU access.
 
 Both tools must use the same cluster credentials. `kubectl` uses `KUBECONFIG`
-or its default `~/.kube/config`; the role explicitly reads the Ansible
-`kubeconfig` variable. Exporting `KUBECONFIG` does not override that variable.
+or its default `~/.kube/config`; the playbook passes the Ansible
+`kubeconfig` variable to every Kubernetes module. Exporting `KUBECONFIG` does not override that variable.
 Keep it defined once in your existing inventory, for example in Vault:
 
 ```yaml
@@ -197,12 +210,10 @@ settings such as DSM credentials remain in Vault.
 Update the existing settings below rather than adding duplicate YAML keys:
 
 ```yaml
-emby_media_mount_path: "/media"
 emby_uid: "<numeric-uid>"
 emby_gid: "<numeric-gid>"
 emby_config_storage_size: 10Gi
 # Optional:
-# emby_gidlist: "1000,1001"
 # emby_media_read_only: false
 ```
 
@@ -236,23 +247,20 @@ beside it.
 | `emby_config_claim` | Claim `emby-config-iscsi`. |
 | `emby_config_storage_class` | `synology-iscsi-storage`. |
 | `emby_config_storage_size` | `10Gi`; allow space for metadata and future growth. |
-| `emby_media_manage` | `true`; create the static NFS PV and PVC. |
+| `emby_config_pv` | Empty. The name of the volume holding your Emby settings, printed after the first deploy. When set, the config claim binds only to it. |
+| `emby_transcode_size` | `4Gi`. Size of the memory-backed scratch volume mounted at `/transcode`. It counts against the node's memory. |
 | `emby_media_nfs_server` | Defaults to `synology_csi_dsm_host` from inventory; no separate NAS address is needed. |
 | `emby_media_nfs_share` | Required exported media directory; set in encrypted Vault. |
 | `emby_media_pv` | `{{ emby_namespace }}-media-nfs`; unique cluster-wide PV name and CSI handle. |
-| `emby_media_capacity` | `1Ti`; binding metadata, not an NFS quota. |
-| `emby_media_mount_options` | `[nfsvers=4.1]`; must match NAS support. |
-| `emby_media_claim` | `emby-media`; created by default, or reused with `emby_media_manage: false`. |
-| `emby_media_mount_path` | `/media`; select this path when adding libraries. |
+| `emby_media_capacity` | `10Ti`; binding metadata, not an NFS quota. |
+| `emby_media_claim` | `emby-media`; the role creates it and its static NFS PV. |
 | `emby_media_read_only` | `true`. |
 | `emby_uid`, `emby_gid` | Required numeric IDs with read access to the NAS media files. |
-| `emby_gidlist` | Defaults to `emby_gid`. |
 | `emby_service_ip` | Required reserved LAN IPv4 address; set in encrypted Vault. |
-| `emby_load_balancer_class` | `metallb.io/metallb`; must match MetalLB's configured class. |
-| `emby_metallb_namespace` | `metallb-system`. |
 | `emby_proxy_image`, `emby_proxy_version` | Pinned NGINX image configured in role defaults. |
 | `emby_cluster_issuer` | `letsencrypt-production`. |
-| `emby_wait_timeout` | `300` seconds for each final readiness wait. |
+| `emby_wait_timeout` | `300` seconds for each readiness wait. The StatefulSet wait includes certificate issuance, so raise this if DNS-01 issuance is slow. |
+| `emby_wait_delay`, `emby_wait_retries` | Polling interval (`5` seconds) and the retry count derived from it and the timeout. |
 
 Review the tasks and syntax:
 
@@ -278,7 +286,7 @@ export path shown by DSM as `emby_media_nfs_share`.
 Allow NFSv4.1 traffic, normally TCP 2049, through the NAS and inter-VLAN
 firewalls. The UID/GID you configure for Emby must have permission to traverse
 directories and read files. Do not make the files world-writable to bypass a
-permission error. Media is mounted read-only by default.
+permission error. Media is mounted read-only by default (`emby_media_read_only`).
 
 The role uses a static NFS volume: it mounts the export directly, so Emby
 sees the media already stored there. It does not create an empty per-claim
@@ -300,8 +308,8 @@ Reserve `<emby-service-ip>` outside the DHCP pool. Do not assign it to a VM's
 network interface. Set your LAN DNS record for the Emby hostname to this IP.
 Use at least two workers on the same layer-2 network as this address if you
 want Emby to move between workers. Each needs access to both NAS storage
-protocols. The pod's required node affinity excludes control-plane nodes and
-nodes excluded from external load balancing, without pinning a hostname.
+protocols. The pod's required node affinity excludes control-plane nodes,
+without pinning a hostname.
 
 Bootstrap installs MetalLB with `loadBalancerClass: metallb.io/metallb`.
 Emby's Service explicitly selects that class, while K3s ServiceLB handles
@@ -320,8 +328,9 @@ address from the node with a ready service endpoint. NGINX and Emby are in
 one pod, so HTTPS termination and playback use the same worker. The proxy
 supports WebSockets and streaming without response buffering. Cert-manager
 uses DNS-01, so issuance does not depend on this service being reachable.
-The proxy checks mounted certificate files every ten seconds and reloads
-NGINX after renewal; Kubernetes Secret projection can add a delay.
+The proxy reads the mounted certificate files on every TLS handshake, so
+NGINX uses a renewed certificate without a reload; Kubernetes Secret
+projection can add a delay before the new files appear.
 
 For access from outside your LAN, separately configure public DNS and router
 TCP 443 forwarding to this IP. A router forwarding TCP 443 to shared Traefik
@@ -337,10 +346,11 @@ ansible-playbook playbooks/applications/emby.yml --syntax-check
 ansible-playbook playbooks/applications/emby.yml
 ```
 
-The role validates the storage drivers, creates the namespace and claims,
+The role first validates your settings, then checks the storage drivers, creates the namespace and claims,
 waits for the media claim to bind, and creates the MetalLB pool and Certificate.
-It waits for a Ready certificate before starting the StatefulSet and HTTPS
-proxy, then waits for the current pod revision and service IP allocation.
+It then applies the StatefulSet and HTTPS proxy, which cannot start until
+cert-manager issues the certificate, and waits for the current pod revision
+and service IP allocation.
 
 The config claim uses Synology's `WaitForFirstConsumer` binding mode, so it
 may remain Pending until `emby-0` is scheduled. This is expected: the role
@@ -384,8 +394,21 @@ and media references `emby-media`. The role's TCP
 readiness probe confirms port 8096 responds; it is not a full database test.
 
 Open the configured HTTPS hostname and complete Emby's first-run wizard.
-Create the administrator account and add libraries under `/media` (or your
-chosen media mount path). Play a file to verify media access.
+Create the administrator account and add libraries under `/media` . Play a file to verify media access.
+
+### Use Memory for Transcoding
+
+The pod mounts a memory-backed volume at `/transcode`, so transcoding writes
+stay off the config volume and the NAS. Emby does not use it until you point it
+there. In Emby, open Settings, then Transcoding, and set the transcoding
+temporary path to `/transcode`.
+
+The volume is `emby_transcode_size` (`4Gi`) and lives in the node's RAM.
+Transcode segments are deleted as playback moves on, but if one stream's
+working files grow past the size limit, Kubernetes evicts the pod. Raise the
+size if you run several transcodes at once, and make sure the worker has the
+memory to spare. The contents are lost when the pod restarts, which is fine
+for temporary files.
 
 To isolate Emby from proxy/DNS problems:
 
@@ -422,7 +445,8 @@ kubectl describe pod -n emby -l app=emby
 | Image pull failure | Exact tag, registry reachability, architecture and authentication. |
 | Permission denied | Numeric ownership, UID/GID/GIDLIST, export permissions, read-only mounts. |
 | Pod Ready but HTTPS fails | DNS, MetalLB announcement, proxy logs, Service endpoints and Certificate events. |
-| Immutable selector error | Adapt the template to the existing selector rather than blindly deleting resources. |
+| Claim Pending: `volume ... already bound to a different claim` | A retained volume still points at a deleted claim. Set `emby_config_pv` to your config volume and re-run; the role reattaches released volumes. |
+| API rejects a StatefulSet update as immutable (selector, `serviceName`) | Adapt the template to the existing StatefulSet rather than blindly deleting resources. |
 
 Provisioning happens in the controller; mounting happens on the node:
 
@@ -457,7 +481,7 @@ using it. Increasing login retries does not fix a blocked port.
 Keep one replica. All pods produced by this role would reference the same
 config claim, so scaling replicas is not a way to add Emby capacity.
 The StatefulSet keeps the pod name `emby-0`; its headless governing Service
-is `emby-headless`. Client traffic uses the separate ClusterIP Service `emby`.
+is `emby-headless`. Client traffic uses the separate LoadBalancer Service `emby`.
 
 The config PVC is declared separately from the StatefulSet, rather than in
 `volumeClaimTemplates`. Its identity remains explicit and independent of
@@ -490,6 +514,40 @@ For more config capacity, increase `emby_config_storage_size` and rerun the
 role if the StorageClass permits expansion. Verify the claim and filesystem
 afterwards. Claims cannot be shrunk, and their StorageClass cannot be changed
 in place.
+
+### Redeploy Without Losing Settings
+
+Your Emby settings live on the config volume. After the first successful run
+the role sets that volume's reclaim policy to `Retain` and prints its name:
+
+```text
+Pin your Emby settings so redeploys always reattach them: set
+emby_config_pv to "pvc-...".
+```
+
+Set `emby_config_pv` to that name in `roles/emby/defaults/main.yml` (or in
+inventory). From then on the config claim binds only to that volume, so a
+redeploy can never provision a new, empty one. You can tear down and redeploy
+with no manual steps:
+
+```bash
+kubectl delete namespace emby
+ansible-playbook playbooks/applications/emby.yml
+```
+
+A volume keeps the UID of its deleted claim and refuses a new claim
+(`volume ... already bound to a different claim`). Before creating the claims,
+the role clears that reference on the pinned config volume and on the media
+volume, but only when the volume is `Released`. It never touches a volume that
+is `Bound`, and it stops if a volume is reserved for another namespace or
+claim, or if the pinned volume no longer exists.
+
+Without a pin, the first deploy provisions a new config volume. A later
+redeploy then also provisions a new one and your settings stay on the old
+volume, so pin the name after the first run.
+
+To discard your settings on purpose, delete the volume (`kubectl delete pv
+<volume-name>`), remove its LUN in DSM, and clear `emby_config_pv`.
 
 Check the actual PV reclaim policy before removing storage resources:
 

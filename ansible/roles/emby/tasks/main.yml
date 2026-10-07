@@ -1,19 +1,31 @@
 ---
-- name: Require the private Emby service address
+# The kubeconfig comes from module_defaults in playbooks/applications/emby.yml.
+
+# "always" keeps this check in place when running with --tags emby_storage.
+- name: Validate Emby settings
+  tags: [always]
   ansible.builtin.assert:
     that:
-      - emby_service_ip | default('') | length > 0
-    fail_msg: Set emby_service_ip in inventory/group_vars/all/vault.yml to the reserved LAN IPv4 address.
+      - emby_service_ip | default('') is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
+      - emby_version | length > 0
+      - emby_version != 'latest'
+      - emby_uid | string is match('^[0-9]+$')
+      - emby_gid | string is match('^[0-9]+$')
+      - emby_media_claim | length > 0
+      - emby_media_nfs_server | length > 0
+      - emby_media_nfs_share is match('^/')
+    fail_msg: >-
+      Set emby_service_ip (reserved LAN IPv4) in inventory/group_vars/all/vault.yml,
+      a pinned emby_version, numeric emby_uid/emby_gid with access to the media
+      export, emby_media_claim and emby_media_nfs_share (exported media directory),
+      and make synology_csi_dsm_host or emby_media_nfs_server available.
 
 - name: Inspect eligible Emby workers
   kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
     api_version: v1
     kind: Node
     label_selectors:
       - "!node-role.kubernetes.io/control-plane"
-      - "!node-role.kubernetes.io/master"
-      - "!node.kubernetes.io/exclude-from-external-load-balancers"
   register: emby_workers
 
 - name: Require at least one eligible worker
@@ -24,10 +36,9 @@
 
 - name: Inspect MetalLB installation
   kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
     api_version: apps/v1
     kind: Deployment
-    namespace: "{{ emby_metallb_namespace }}"
+    namespace: metallb-system
     name: metallb-controller
   register: emby_metallb
 
@@ -42,7 +53,6 @@
   block:
     - name: Inspect Emby config StorageClass
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
         api_version: storage.k8s.io/v1
         kind: StorageClass
         name: "{{ emby_config_storage_class }}"
@@ -56,10 +66,21 @@
           - emby_storage_class.resources[0].parameters.protocol | default('iscsi') == 'iscsi'
         fail_msg: Run Synology CSI cluster bootstrap before preparing Emby storage.
 
+    - name: Verify NFS CSI is installed
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: CSIDriver
+        name: nfs.csi.k8s.io
+      register: emby_nfs_driver
+
+    - name: Require the NFS CSI driver
+      ansible.builtin.assert:
+        that:
+          - emby_nfs_driver.resources | length == 1
+        fail_msg: Run the nfs_csi role in cluster bootstrap first.
+
     - name: Create Emby namespace
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
         apply: true
         definition:
           apiVersion: v1
@@ -67,14 +88,67 @@
           metadata:
             name: "{{ emby_namespace }}"
 
-    - name: Prepare managed NFS media storage
-      ansible.builtin.include_tasks: media.yml
-      when: emby_media_manage | bool
+    # A Retain volume keeps the UID of its deleted claim, so a new claim cannot
+    # bind to it. Clear that reference on the volumes this role binds by name.
+    - name: Inspect the retained volumes
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ item }}"
+      loop: "{{ [emby_media_pv] + ([emby_config_pv] if emby_config_pv | length > 0 else []) }}"
+      register: emby_retained
+
+    - name: Require the pinned config volume to exist
+      ansible.builtin.assert:
+        that:
+          - (emby_retained.results | selectattr('item', 'eq', emby_config_pv) | first).resources | length == 1
+        fail_msg: >-
+          Volume {{ emby_config_pv }} (emby_config_pv) does not exist. It holds your Emby
+          settings, so the role will not provision a new one. Fix the name, or clear
+          emby_config_pv to start with fresh settings.
+      when: emby_config_pv | length > 0
+
+    - name: Require the retained volumes to belong to Emby
+      vars:
+        claim: "{{ emby_config_claim if item.item == emby_config_pv else emby_media_claim }}"
+        ref: "{{ item.resources[0].spec.claimRef | default({}) }}"
+      ansible.builtin.assert:
+        that:
+          - ref.name | default(claim) == claim
+          - ref.namespace | default(emby_namespace) == emby_namespace
+        fail_msg: >-
+          Volume {{ item.item }} is reserved for {{ ref.namespace | default('?') }}/{{ ref.name | default('?') }},
+          not {{ emby_namespace }}/{{ claim }}. Check emby_config_pv.
+      loop: "{{ emby_retained.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.resources | length == 1
+
+    - name: Reattach released volumes to their claims
+      vars:
+        claim: "{{ emby_config_claim if item.item == emby_config_pv else emby_media_claim }}"
+      kubernetes.core.k8s_json_patch:
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ item.item }}"
+        patch:
+          - op: add
+            path: /spec/claimRef
+            value:
+              namespace: "{{ emby_namespace }}"
+              name: "{{ claim }}"
+      loop: "{{ emby_retained.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.resources | length == 1 and item.resources[0].status.phase == 'Released'
+
+    - name: Create static NFS media PV and PVC
+      kubernetes.core.k8s:
+        apply: true
+        template: media.yml.j2
 
     - name: Create Emby iSCSI config claim
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
-        state: present
         apply: true
         definition:
           apiVersion: v1
@@ -86,25 +160,14 @@
             accessModes: [ReadWriteOnce]
             volumeMode: Filesystem
             storageClassName: "{{ emby_config_storage_class }}"
+            volumeName: "{{ emby_config_pv }}"
             resources:
               requests:
                 storage: "{{ emby_config_storage_size }}"
 
-- name: Validate Emby settings
-  ansible.builtin.assert:
-    that:
-      - emby_version | length > 0
-      - emby_version != 'latest'
-      - emby_media_claim | length > 0
-      - emby_uid | string is match('^[0-9]+$')
-      - emby_gid | string is match('^[0-9]+$')
-    fail_msg: >-
-      Set a pinned emby_version, NFS emby_media_claim and numeric
-      UID/GID with access to the media export.
-
-- name: Inspect Emby media claim
+# Fails the task when the claim is not Bound within emby_wait_timeout.
+- name: Wait for the Emby media claim to bind
   kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
     api_version: v1
     kind: PersistentVolumeClaim
     namespace: "{{ emby_namespace }}"
@@ -113,109 +176,61 @@
   until:
     - emby_media_pvc.resources | length == 1
     - emby_media_pvc.resources[0].status.phase | default('') == 'Bound'
-  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
-  delay: 5
+  retries: "{{ emby_wait_retries }}"
+  delay: "{{ emby_wait_delay }}"
   when: not ansible_check_mode
-
-- name: Require an existing bound media claim
-  ansible.builtin.assert:
-    that:
-      - emby_media_pvc.resources | length == 1
-      - emby_media_pvc.resources[0].status.phase | default('') == 'Bound'
-    fail_msg: The media PVC must be Bound before deploying Emby.
-  when: not ansible_check_mode
-
-- name: Inspect Emby media volume
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
-    api_version: v1
-    kind: PersistentVolume
-    name: "{{ emby_media_pvc.resources[0].spec.volumeName }}"
-  register: emby_media_pv
-  when: not ansible_check_mode
-
-- name: Verify media uses NFS
-  ansible.builtin.assert:
-    that:
-      - emby_media_pv.resources | length == 1
-      - >-
-        emby_media_pv.resources[0].spec.nfs is defined or
-        (emby_media_pv.resources[0].spec.csi.driver | default('')) == 'nfs.csi.k8s.io'
-    fail_msg: The existing media volume must use NFS or nfs.csi.k8s.io.
-  when: not ansible_check_mode
-
-- name: Inspect existing Emby StatefulSet
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
-    api_version: apps/v1
-    kind: StatefulSet
-    namespace: "{{ emby_namespace }}"
-    name: emby
-  register: emby_existing
-
-- name: Verify existing StatefulSet immutable settings are compatible
-  ansible.builtin.assert:
-    that:
-      - >-
-        emby_existing.resources[0].spec.selector == {'matchLabels': {'app': 'emby'}}
-      - emby_existing.resources[0].spec.serviceName == 'emby-headless'
-    fail_msg: Existing immutable selector differs; adapt the role template before applying it.
-  when: emby_existing.resources | length > 0
 
 - name: Configure Emby address advertisement and certificate
   kubernetes.core.k8s:
-    kubeconfig: "{{ kubeconfig }}"
-    state: present
     apply: true
-    definition: "{{ lookup('template', 'network.yml.j2') | from_yaml_all | list }}"
+    template: network.yml.j2
   register: emby_network
   until: emby_network is succeeded
   retries: 12
   delay: 5
 
-- name: Wait for Emby certificate
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
-    api_version: cert-manager.io/v1
-    kind: Certificate
-    namespace: "{{ emby_namespace }}"
-    name: emby-tls
-    wait: true
-    wait_condition:
-      type: Ready
-      status: "True"
-    wait_timeout: "{{ emby_wait_timeout }}"
-  when: not ansible_check_mode
-
+# The pod cannot start until cert-manager issues the emby-tls secret, so this
+# wait covers certificate issuance and the current StatefulSet revision.
 - name: Apply Emby StatefulSet, services and HTTPS proxy
   kubernetes.core.k8s:
-    kubeconfig: "{{ kubeconfig }}"
-    state: present
     apply: true
-    definition: "{{ lookup('template', 'resources.yml.j2') | from_yaml_all | list }}"
+    template: resources.yml.j2
+    wait: true
+    wait_timeout: "{{ emby_wait_timeout }}"
 
-- name: Wait for the current Emby StatefulSet revision
+# Without this the storage class may delete the volume, and your Emby settings,
+# when its claim is deleted. Redeploys then find the volume and reattach it.
+- name: Look up the bound config volume
   kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
-    api_version: apps/v1
-    kind: StatefulSet
+    api_version: v1
+    kind: PersistentVolumeClaim
     namespace: "{{ emby_namespace }}"
-    name: emby
-  register: emby_statefulset
-  until:
-    - emby_statefulset.resources | length == 1
-    - emby_statefulset.resources[0].status.observedGeneration | default(0) | int >= emby_statefulset.resources[0].metadata.generation | int
-    - emby_statefulset.resources[0].status.readyReplicas | default(0) | int == 1
-    - emby_statefulset.resources[0].status.updatedReplicas | default(0) | int == 1
-    - emby_statefulset.resources[0].status.currentRevision | default('') | length > 0
-    - emby_statefulset.resources[0].status.currentRevision | default('') == emby_statefulset.resources[0].status.updateRevision | default('')
-  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
-  delay: 5
+    name: "{{ emby_config_claim }}"
+  register: emby_config_bound
   when: not ansible_check_mode
 
+- name: Keep the config volume when its claim is deleted
+  kubernetes.core.k8s:
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ emby_config_bound.resources[0].spec.volumeName }}"
+      spec:
+        persistentVolumeReclaimPolicy: Retain
+  when: not ansible_check_mode
+
+- name: Show the config volume to pin
+  ansible.builtin.debug:
+    msg: >-
+      Pin your Emby settings so redeploys always reattach them: set
+      emby_config_pv to "{{ emby_config_bound.resources[0].spec.volumeName }}".
+  when: not ansible_check_mode and emby_config_pv | length == 0
+
+# The collection only waits for the Service to exist, not for its address.
 - name: Wait for Emby service IP allocation
   kubernetes.core.k8s_info:
-    kubeconfig: "{{ kubeconfig }}"
     api_version: v1
     kind: Service
     name: emby
@@ -224,6 +239,6 @@
   until:
     - emby_service.resources | length == 1
     - emby_service_ip in (emby_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip') | list)
-  retries: "{{ ((emby_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
-  delay: 5
+  retries: "{{ emby_wait_retries }}"
+  delay: "{{ emby_wait_delay }}"
   when: not ansible_check_mode

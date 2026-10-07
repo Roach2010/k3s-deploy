@@ -8,11 +8,15 @@ http {
         default upgrade;
         '' close;
     }
+    # Variables make NGINX read the certificate files on every TLS handshake,
+    # so a renewed certificate is used without a reload.
+    map $ssl_server_name $emby_tls_cert { default /tls/tls.crt; }
+    map $ssl_server_name $emby_tls_key { default /tls/tls.key; }
     server {
         listen 8443 ssl;
         server_name {{ emby_hostname }};
-        ssl_certificate /tls/tls.crt;
-        ssl_certificate_key /tls/tls.key;
+        ssl_certificate $emby_tls_cert;
+        ssl_certificate_key $emby_tls_key;
         ssl_protocols TLSv1.2 TLSv1.3;
         client_max_body_size 0;
         location = /healthz { return 200 'ok'; }
