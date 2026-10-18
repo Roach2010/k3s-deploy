@@ -1,0 +1,182 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headscale
+  namespace: {{ headscale_namespace | to_json }}
+data:
+  config.yaml: |-
+{{ lookup('template', 'config.yaml.j2') | indent(4, true) }}
+  policy.json: {{ headscale_policy | to_nice_json | to_json }}
+  nginx.conf: |-
+{{ lookup('template', 'proxy.conf.j2') | indent(4, true) }}
+  start.sh: |-
+{{ lookup('template', 'proxy-start.sh.j2') | indent(4, true) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headscale
+  namespace: {{ headscale_namespace | to_json }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: headscale
+  template:
+    metadata:
+      labels:
+        app: headscale
+      annotations:
+        checksum/config: {{ (lookup('template', 'config.yaml.j2') ~ (headscale_policy | to_nice_json)) | hash('sha256') | to_json }}
+        checksum/proxy: {{ (lookup('template', 'proxy.conf.j2') ~ lookup('template', 'proxy-start.sh.j2')) | hash('sha256') | to_json }}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: node.kubernetes.io/exclude-from-external-load-balancers
+                    operator: DoesNotExist
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: headscale
+          image: {{ (headscale_image ~ ':' ~ headscale_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          args: [serve]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          resources: {{ headscale_resources | to_json }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/headscale
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/headscale
+            - name: run
+              mountPath: /var/run/headscale
+            - name: tmp
+              mountPath: /tmp
+        - name: https-proxy
+          image: {{ (headscale_proxy_image ~ ':' ~ headscale_proxy_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, /proxy/start.sh]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: proxy
+              mountPath: /proxy
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: headscale
+            items:
+              - key: config.yaml
+                path: config.yaml
+              - key: policy.json
+                path: policy.json
+        - name: proxy
+          configMap:
+            name: headscale
+            defaultMode: 0555
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+              - key: start.sh
+                path: start.sh
+        - name: tls
+          secret:
+            secretName: headscale-tls
+        - name: data
+          persistentVolumeClaim:
+            claimName: headscale-data
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale
+  namespace: {{ headscale_namespace | to_json }}
+  labels:
+    app: headscale
+  annotations:
+    metallb.io/address-pool: headscale
+    metallb.io/loadBalancerIPs: {{ headscale_service_ip | to_json }}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: {{ headscale_load_balancer_class | to_json }}
+  externalTrafficPolicy: Local
+  selector:
+    app: headscale
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

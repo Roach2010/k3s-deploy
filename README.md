@@ -88,7 +88,7 @@ Before running scripts, it helps to understand what is happening under the hood.
 │       ├── cluster_issuer/    # Let's Encrypt staging and production issuers
 │       ├── certificate_test/
 │       ├── emby/             # StatefulSet, iSCSI config, NFS media, and local HTTPS
-│       └── headscale/         # Headscale, persistent data, and HTTPS ingress
+│       └── headscale/         # Headscale, persistent data, and HTTPS proxy
 ├── .gitignore                 # Prevents secrets, cache, and rendered output from hitting Git
 ├── rendered/                  # Transient output directory for compiled .ign files (Git-ignored)
 └── ova/                       # Local cache directory for downloaded FCOS binaries (Git-ignored)
@@ -688,15 +688,16 @@ maintenance commands.
 
 ### Deploying Headscale
 
-Headscale is deployed separately from cluster bootstrap. Its role uses the
-existing Traefik ingress and Let's Encrypt production issuer, with one
-Headscale replica and a persistent SQLite database.
+Headscale is deployed separately from cluster bootstrap. Its role uses a
+dedicated MetalLB address and an NGINX HTTPS sidecar, with a Let's Encrypt
+production certificate, one Headscale replica and a persistent SQLite database.
 
-Before deploying, configure a resilient **block-storage** class through
-`headscale_storage_class` in the Ansible inventory. The role deliberately
-has no storage default: the database must survive a node failure, and SQLite
-WAL files must not live on the NFS share. Also configure public DNS and TCP
-443 forwarding for `headscale.compvirt.com`, using Cloudflare **DNS only**.
+The data claim uses the `synology-iscsi-storage` class, matching Emby's config
+volume. The role retains the PV and can reattach it after claim deletion. Set
+the reserved `headscale_service_ip` in the encrypted vault. The database and
+SQLite WAL files use iSCSI block storage, not the NFS media share. Configure
+public DNS and router TCP 443 forwarding to the Headscale service IP for
+`headscale.compvirt.com`, using Cloudflare **DNS only**.
 
 From `ansible/`, after completing those prerequisites:
 
@@ -704,7 +705,13 @@ From `ansible/`, after completing those prerequisites:
 ansible-playbook playbooks/applications/headscale.yml
 ```
 
-See the [Headscale role guide](ansible/roles/headscale/README.md) for storage
+NGINX terminates TLS in the Headscale pod and forwards to Headscale over the
+pod's loopback interface. MetalLB advertises the service IP from the worker
+hosting the ready pod, and `externalTrafficPolicy: Local` keeps client traffic
+on that worker. After the first successful deployment, pin the PV name printed
+by the role in `inventory/group_vars/all/vars.yml`; the role sets its reclaim
+policy to `Retain` and can reattach it after claim deletion. See the
+[Headscale role guide](ansible/roles/headscale/README.md) for storage
 requirements, DNS, client registration, verification, and backup instructions.
 
 ---

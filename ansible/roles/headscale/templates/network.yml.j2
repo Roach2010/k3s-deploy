@@ -1,0 +1,42 @@
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: headscale
+  namespace: {{ headscale_metallb_namespace | to_json }}
+spec:
+  addresses: [{{ (headscale_service_ip ~ '/32') | to_json }}]
+  autoAssign: false
+  serviceAllocation:
+    namespaces: [{{ headscale_namespace | to_json }}]
+    serviceSelectors:
+      - matchLabels:
+          app: headscale
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: headscale
+  namespace: {{ headscale_metallb_namespace | to_json }}
+spec:
+  ipAddressPools: [headscale]
+  nodeSelectors:
+    - matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: DoesNotExist
+        - key: node-role.kubernetes.io/master
+          operator: DoesNotExist
+        - key: node.kubernetes.io/exclude-from-external-load-balancers
+          operator: DoesNotExist
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: headscale-tls
+  namespace: {{ headscale_namespace | to_json }}
+spec:
+  secretName: headscale-tls
+  dnsNames: [{{ headscale_hostname | to_json }}]
+  issuerRef:
+    name: {{ headscale_cluster_issuer | to_json }}
+    kind: ClusterIssuer

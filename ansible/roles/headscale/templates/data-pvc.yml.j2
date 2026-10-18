@@ -1,0 +1,16 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: headscale-data
+  namespace: {{ headscale_namespace | to_json }}
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: {{ headscale_storage_class | to_json }}
+{% if headscale_data_pv | length > 0 %}
+  volumeName: {{ headscale_data_pv | to_json }}
+{% endif %}
+  resources:
+    requests:
+      storage: {{ headscale_storage_size | to_json }}

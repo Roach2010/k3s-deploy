@@ -1,0 +1,41 @@
+---
+headscale_namespace: headscale
+headscale_hostname: "headscale.{{ domain }}"
+headscale_version: "0.29.4"
+headscale_image: ghcr.io/juanfont/headscale
+# Set the dedicated LAN endpoint in inventory/group_vars/all/vault.yml.
+headscale_service_ip: ""
+headscale_load_balancer_class: metallb.io/metallb
+headscale_metallb_namespace: metallb-system
+headscale_proxy_image: nginx
+headscale_proxy_version: "1.28.3-alpine"
+headscale_cluster_issuer: letsencrypt-production
+
+# SQLite uses the Synology iSCSI StorageClass, matching Emby's config volume.
+headscale_storage_class: synology-iscsi-storage
+headscale_storage_size: 1Gi
+# Set to the PV name printed after the first deployment to reattach retained data.
+headscale_data_pv: ""
+headscale_wait_timeout: 300
+
+headscale_magic_dns_domain: "tailnet.{{ domain }}"
+# Keep clients' existing DNS resolvers; MagicDNS supplies tailnet hostnames.
+headscale_dns_override_local: false
+headscale_dns_nameservers: []
+headscale_dns_split: {}
+headscale_node_expiry: 180d
+
+# Personal devices can reach other devices owned by the same user.
+# Subnet routes, exit nodes, tagged devices and cross-user access need policy changes.
+headscale_policy:
+  grants:
+    - src: ["autogroup:member"]
+      dst: ["autogroup:self"]
+      ip: ["*"]
+
+headscale_resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

@@ -1,0 +1,246 @@
+---
+- name: Validate Headscale settings
+  ansible.builtin.assert:
+    that:
+      - headscale_version | length > 0
+      - headscale_version != 'latest'
+      - headscale_storage_class | length > 0
+      - headscale_service_ip | length > 0
+      - headscale_hostname is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+      - headscale_magic_dns_domain != headscale_hostname
+      - not headscale_hostname.endswith('.' ~ headscale_magic_dns_domain)
+    fail_msg: >-
+      Set a pinned headscale_version, headscale_storage_class and reserved
+      headscale_service_ip. Use distinct Headscale and MagicDNS domains.
+
+- name: Inspect eligible Headscale workers
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Node
+    label_selectors:
+      - "!node-role.kubernetes.io/control-plane"
+      - "!node-role.kubernetes.io/master"
+      - "!node.kubernetes.io/exclude-from-external-load-balancers"
+  register: headscale_workers
+
+- name: Require at least one eligible worker
+  ansible.builtin.assert:
+    that:
+      - headscale_workers.resources | length > 0
+    fail_msg: Headscale requires at least one worker eligible for the MetalLB service IP.
+
+- name: Inspect MetalLB installation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ headscale_metallb_namespace }}"
+    name: metallb-controller
+  register: headscale_metallb
+
+- name: Require MetalLB cluster bootstrap
+  ansible.builtin.assert:
+    that:
+      - headscale_metallb.resources | length == 1
+    fail_msg: Run bootstrap-cluster.yml --tags metallb before deploying Headscale.
+
+- name: Prepare Headscale storage
+  tags: [headscale_storage]
+  block:
+    - name: Inspect Headscale data StorageClass
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ headscale_storage_class }}"
+      register: headscale_storage
+
+    - name: Require Synology iSCSI storage
+      ansible.builtin.assert:
+        that:
+          - headscale_storage.resources | length == 1
+          - headscale_storage.resources[0].provisioner == 'csi.san.synology.com'
+          - headscale_storage.resources[0].parameters.protocol | default('iscsi') == 'iscsi'
+        fail_msg: Run Synology CSI cluster bootstrap before preparing Headscale storage.
+
+    - name: Create Headscale namespace
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ headscale_namespace }}"
+
+    - name: Inspect the existing Headscale data claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ headscale_namespace }}"
+        name: headscale-data
+      register: headscale_existing_claim
+
+    - name: Inspect the pinned Headscale data volume
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ headscale_data_pv }}"
+      register: headscale_pinned_volume
+      when: headscale_data_pv | length > 0
+
+    - name: Require the pinned Headscale data volume to exist
+      ansible.builtin.assert:
+        that:
+          - headscale_pinned_volume.resources | length == 1
+        fail_msg: >-
+          The pinned volume {{ headscale_data_pv }} does not exist. Check
+          headscale_data_pv; the role will not silently provision a replacement
+          for registered Headscale data.
+      when: headscale_data_pv | length > 0
+
+    - name: Validate the pinned Headscale data volume
+      vars:
+        headscale_pinned_claim_ref: "{{ headscale_pinned_volume.resources[0].spec.claimRef | default({}, true) }}"
+      ansible.builtin.assert:
+        that:
+          - headscale_pinned_volume.resources[0].spec.storageClassName == headscale_storage_class
+          - headscale_pinned_claim_ref.name | default('headscale-data') == 'headscale-data'
+          - headscale_pinned_claim_ref.namespace | default(headscale_namespace) == headscale_namespace
+        fail_msg: >-
+          The pinned volume {{ headscale_data_pv }} uses a different storage
+          class or is reserved for another claim. Check headscale_data_pv.
+      when: headscale_data_pv | length > 0
+
+    - name: Ensure the pin matches the currently bound Headscale claim
+      ansible.builtin.assert:
+        that:
+          - headscale_existing_claim.resources[0].spec.volumeName == headscale_data_pv
+        fail_msg: >-
+          The existing Headscale claim is bound to
+          {{ headscale_existing_claim.resources[0].spec.volumeName }}, not
+          {{ headscale_data_pv }}. Keep the existing PV pin or resolve the
+          claim before changing it.
+      when:
+        - headscale_data_pv | length > 0
+        - headscale_existing_claim.resources | length == 1
+        - headscale_existing_claim.resources[0].spec.volumeName | default('') | length > 0
+
+    - name: Reattach a released Headscale data volume
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ headscale_data_pv }}"
+        patch:
+          - op: add
+            path: /spec/claimRef
+            value:
+              namespace: "{{ headscale_namespace }}"
+              name: headscale-data
+      when:
+        - headscale_data_pv | length > 0
+        - headscale_pinned_volume.resources | length == 1
+        - headscale_pinned_volume.resources[0].status.phase | default('') == 'Released'
+
+    - name: Create Headscale iSCSI data claim
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        template: data-pvc.yml.j2
+
+- name: Configure Headscale address advertisement and certificate
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'network.yml.j2') | from_yaml_all | list }}"
+
+- name: Wait for Headscale certificate
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ headscale_namespace }}"
+    name: headscale-tls
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ headscale_wait_timeout }}"
+  when: not ansible_check_mode
+
+- name: Apply Headscale application resources and HTTPS proxy
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'resources.yml.j2') | from_yaml_all | list }}"
+
+- name: Wait for the Headscale data claim to bind
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ headscale_namespace }}"
+    name: headscale-data
+  register: headscale_bound_claim
+  until:
+    - headscale_bound_claim.resources | length == 1
+    - headscale_bound_claim.resources[0].status.phase | default('') == 'Bound'
+  retries: "{{ ((headscale_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Keep the Headscale data volume when its claim is deleted
+  kubernetes.core.k8s:
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ headscale_bound_claim.resources[0].spec.volumeName }}"
+      spec:
+        persistentVolumeReclaimPolicy: Retain
+  when: not ansible_check_mode
+
+- name: Show the Headscale data volume to pin
+  ansible.builtin.debug:
+    msg: >-
+      Pin your Headscale data volume so redeploys can reattach it: set
+      headscale_data_pv to "{{ headscale_bound_claim.resources[0].spec.volumeName }}"
+      in inventory/group_vars/all/vars.yml.
+  when: not ansible_check_mode and headscale_data_pv | length == 0
+
+- name: Wait for the current Headscale Deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ headscale_namespace }}"
+    name: headscale
+  register: headscale_deployment
+  until:
+    - headscale_deployment.resources | length == 1
+    - headscale_deployment.resources[0].status.observedGeneration | default(0) | int >= headscale_deployment.resources[0].metadata.generation | int
+    - headscale_deployment.resources[0].status.readyReplicas | default(0) | int == 1
+    - headscale_deployment.resources[0].status.updatedReplicas | default(0) | int == 1
+  retries: "{{ ((headscale_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Wait for Headscale service IP allocation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Service
+    name: headscale
+    namespace: "{{ headscale_namespace }}"
+  register: headscale_service
+  until:
+    - headscale_service.resources | length == 1
+    - headscale_service_ip in (headscale_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip') | list)
+  retries: "{{ ((headscale_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
