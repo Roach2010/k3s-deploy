@@ -55,6 +55,16 @@ worker. Do not add browser authentication middleware in front of the client
 control endpoint. Metrics and the remote admin gRPC listener remain bound to
 loopback inside the Headscale container.
 
+Headplane runs as another container in the same pod and is available at
+`https://headscale.compvirt.com/admin/` through the existing NGINX proxy and
+TLS certificate. It adds no LoadBalancer address or public port. Sign in with
+a Headscale API key. Headplane can manage API-backed objects such as users,
+devices and pre-auth keys. This admin path shares the public Headscale hostname
+and is internet-reachable; the UI requires an expiring Headscale API key.
+The Headscale configuration and policy files are mounted read-only, so Ansible
+remains their source of truth; edit those through the repository and redeploy
+instead of changing them in Headplane.
+
 The embedded DERP server is disabled. Clients use the public Tailscale DERP map,
 so this setup does not need inbound UDP 3478 for a Headscale-hosted relay. The
 pod must be able to download the map and clients must be able to reach its relays.
@@ -83,6 +93,8 @@ headscale_service_ip: "<reserved-worker-lan-ip>"
 | `headscale_dns_split` | `{}` | Optional domain-specific DNS resolvers. |
 | `headscale_node_expiry` | `180d` | Default personal-device key lifetime. |
 | `headscale_wait_timeout` | `300` | Readiness timeout in seconds. |
+| `headplane_version` | `0.8.1` | Pinned Headplane image release. |
+| `headplane_cookie_secret` | Empty; required in Vault | 32-character key used to protect Headplane browser sessions. |
 
 The default policy allows personal devices owned by the **same Headscale user**
 to communicate. It does not grant cross-user access, tagged-device access,
@@ -94,26 +106,41 @@ a separately configured subnet router and an appropriate policy.
 
 ## 4. Deployment and Verification
 
-From the repository root, with the existing Ansible environment activated:
+From the repository root, with the existing Ansible environment activated,
+enter `ansible/`, generate a 32-character Headplane session secret, and save it
+in encrypted `inventory/group_vars/all/vault.yml`:
 
 ```bash
 cd ansible
+openssl rand -hex 16
+ansible-vault edit inventory/group_vars/all/vault.yml
+```
+
+```yaml
+headplane_cookie_secret: "<paste-the-32-character-value>"
+```
+
+Run the playbook from the current `ansible/` directory:
+
+```bash
 ansible-playbook playbooks/applications/headscale.yml --syntax-check
 ansible-playbook playbooks/applications/headscale.yml
 ```
 
 The role creates the namespace, MetalLB address pool and advertisement,
-certificate, configuration, PVC, Deployment and LoadBalancer Service, then
-waits for the application and certificate. Configuration, policy and proxy
-checksums trigger a restart when those files change. Repeated runs with the
-same settings should leave the resources unchanged. Check mode skips rollout
-and certificate waits; the storage, MetalLB and issuer preflight reads still
-require a reachable cluster.
+certificate, session Secret, configuration, PVC, Deployment and LoadBalancer
+Service, then waits for the application and certificate. Configuration,
+policy, proxy and Headplane checksums trigger a restart when those files or
+the session secret change. Repeated runs with the same settings should leave
+the resources unchanged. Check mode skips rollout and certificate waits; the
+storage, MetalLB and issuer preflight reads still require a reachable cluster.
 
 After the first deployment, copy the `headscale_data_pv` value printed by the
 role into `inventory/group_vars/all/vars.yml`. The role then pins the PVC to
-that PV on later runs. If the namespace or claim is deleted, wait until
-Kubernetes has finished deleting it, keep the PV pin, and rerun the playbook;
+that PV on later runs. Headplane stores its own database under the same
+persistent volume in `/var/lib/headscale/headplane`. If the namespace or claim
+is deleted, wait until Kubernetes has finished deleting it, keep the PV pin,
+and rerun the playbook;
 the role reclaims the released PV for `headscale-data`. If the PV object itself
 has also been deleted, this automatic reattachment cannot recover it.
 
@@ -122,8 +149,20 @@ kubectl get pod,pvc,svc,certificate -n headscale
 kubectl get ipaddresspool,l2advertisement -n metallb-system headscale
 kubectl logs -n headscale deployment/headscale
 kubectl logs -n headscale deployment/headscale -c https-proxy
+kubectl logs -n headscale deployment/headscale -c headplane
 curl --fail https://headscale.compvirt.com/health
 ```
+
+Create an expiring Headscale API key and use it to sign in at
+`https://headscale.compvirt.com/admin/`:
+
+```bash
+kubectl exec -n headscale deployment/headscale -c headscale -- headscale apikeys create --expiration 90d
+```
+
+Headscale displays the key once. Keep it private and create a replacement when
+it expires. Headplane's cookie secret is stored in Vault and applied as a
+Kubernetes Secret; the generated API key is not stored by Ansible.
 
 Test HTTPS from outside your LAN as well as inside. A valid certificate and
 healthy pod do not by themselves prove public routing or client registration.

@@ -12,6 +12,8 @@ data:
 {{ lookup('template', 'proxy.conf.j2') | indent(4, true) }}
   start.sh: |-
 {{ lookup('template', 'proxy-start.sh.j2') | indent(4, true) }}
+  headplane.yaml: |-
+{{ lookup('template', 'headplane.yaml.j2') | indent(4, true) }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -32,6 +34,8 @@ spec:
       annotations:
         checksum/config: {{ (lookup('template', 'config.yaml.j2') ~ (headscale_policy | to_nice_json)) | hash('sha256') | to_json }}
         checksum/proxy: {{ (lookup('template', 'proxy.conf.j2') ~ lookup('template', 'proxy-start.sh.j2')) | hash('sha256') | to_json }}
+        checksum/headplane: {{ lookup('template', 'headplane.yaml.j2') | hash('sha256') | to_json }}
+        checksum/headplane-secret: {{ headplane_cookie_secret | hash('sha256') | to_json }}
     spec:
       affinity:
         nodeAffinity:
@@ -131,6 +135,48 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+        - name: headplane
+          image: {{ (headplane_image ~ ':' ~ headplane_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: headplane
+              containerPort: 3000
+          startupProbe:
+            tcpSocket:
+              port: headplane
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: headplane
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: headplane
+            periodSeconds: 20
+          resources: {{ headplane_resources | to_json }}
+          volumeMounts:
+            - name: headplane-config
+              mountPath: /etc/headplane
+              readOnly: true
+            - name: config
+              mountPath: /etc/headscale
+              readOnly: true
+            - name: headplane-secret
+              mountPath: /run/headplane
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/headscale
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -140,6 +186,12 @@ spec:
                 path: config.yaml
               - key: policy.json
                 path: policy.json
+        - name: headplane-config
+          configMap:
+            name: headscale
+            items:
+              - key: headplane.yaml
+                path: config.yaml
         - name: proxy
           configMap:
             name: headscale
@@ -152,6 +204,13 @@ spec:
         - name: tls
           secret:
             secretName: headscale-tls
+        - name: headplane-secret
+          secret:
+            secretName: headplane-session
+            defaultMode: 0440
+            items:
+              - key: cookie_secret
+                path: cookie_secret
         - name: data
           persistentVolumeClaim:
             claimName: headscale-data

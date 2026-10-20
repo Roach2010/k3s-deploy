@@ -39,3 +39,15 @@ headscale_resources:
     memory: 128Mi
   limits:
     memory: 512Mi
+
+# Headplane management UI, served at https://<headscale_hostname>/admin/.
+headplane_image: ghcr.io/tale/headplane
+headplane_version: "0.8.1"
+# Set this 32-character session key in inventory/group_vars/all/vault.yml.
+headplane_cookie_secret: ""
+headplane_resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

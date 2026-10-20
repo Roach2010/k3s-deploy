@@ -4,13 +4,17 @@
     that:
       - headscale_version | length > 0
       - headscale_version != 'latest'
+      - headplane_version | length > 0
+      - headplane_version != 'latest'
+      - headplane_cookie_secret | length == 32
       - headscale_storage_class | length > 0
       - headscale_service_ip | length > 0
       - headscale_hostname is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
       - headscale_magic_dns_domain != headscale_hostname
       - not headscale_hostname.endswith('.' ~ headscale_magic_dns_domain)
     fail_msg: >-
-      Set a pinned headscale_version, headscale_storage_class and reserved
+      Set pinned Headscale and Headplane versions, a 32-character
+      headplane_cookie_secret, the Synology iSCSI storage class, and a reserved
       headscale_service_ip. Use distinct Headscale and MagicDNS domains.
 
 - name: Inspect eligible Headscale workers
@@ -171,6 +175,21 @@
       status: "True"
     wait_timeout: "{{ headscale_wait_timeout }}"
   when: not ansible_check_mode
+
+- name: Create Headplane session Secret
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: headplane-session
+        namespace: "{{ headscale_namespace }}"
+      type: Opaque
+      data:
+        cookie_secret: "{{ headplane_cookie_secret | b64encode }}"
+  no_log: true
 
 - name: Apply Headscale application resources and HTTPS proxy
   kubernetes.core.k8s:
