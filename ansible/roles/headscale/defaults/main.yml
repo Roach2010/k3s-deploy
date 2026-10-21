@@ -10,6 +10,9 @@ headscale_metallb_namespace: metallb-system
 headscale_proxy_image: nginx
 headscale_proxy_version: "1.28.3-alpine"
 headscale_cluster_issuer: letsencrypt-production
+# LAN ranges allowed to use Headplane, the management REST API, and status URLs.
+headscale_lan_cidrs:
+  - 192.168.0.0/24
 
 # SQLite uses the Synology iSCSI StorageClass, matching Emby's config volume.
 headscale_storage_class: synology-iscsi-storage

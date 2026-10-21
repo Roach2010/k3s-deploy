@@ -57,13 +57,14 @@ loopback inside the Headscale container.
 
 Headplane runs as another container in the same pod and is available at
 `https://headscale.compvirt.com/admin/` through the existing NGINX proxy and
-TLS certificate. It adds no LoadBalancer address or public port. Sign in with
-a Headscale API key. Headplane can manage API-backed objects such as users,
-devices and pre-auth keys. This admin path shares the public Headscale hostname
-and is internet-reachable; the UI requires an expiring Headscale API key.
-The Headscale configuration and policy files are mounted read-only, so Ansible
-remains their source of truth; edit those through the repository and redeploy
-instead of changing them in Headplane.
+TLS certificate. It adds no LoadBalancer address or public port. NGINX allows
+only `headscale_lan_cidrs` to access `/admin/`, `/api/v1/`, `/health/`,
+`/healthz/` and `/version/`. The root Headscale control endpoint remains public
+for remote devices. Sign in with an expiring Headscale API key; API-key
+sessions have full Headplane access, so keep the key private. The Headscale
+configuration and policy files are mounted read-only, so Ansible remains their
+source of truth; edit those through the repository and redeploy instead of
+changing them in Headplane.
 
 The embedded DERP server is disabled. Clients use the public Tailscale DERP map,
 so this setup does not need inbound UDP 3478 for a Headscale-hosted relay. The
@@ -86,6 +87,7 @@ headscale_service_ip: "<reserved-worker-lan-ip>"
 | `headscale_data_pv` | Empty on first deployment | Pin the PV name printed by the first successful run to enable reattachment after claim deletion. |
 | `headscale_service_ip` | Empty; required in Vault | Reserved LAN IP advertised by MetalLB. |
 | `headscale_proxy_version` | `1.28.3-alpine` | Pinned NGINX sidecar image tag. |
+| `headscale_lan_cidrs` | `[x.x.x.x/x]` | LAN networks allowed to reach Headplane, management API and status endpoints. Includes the client LAN and K3s node subnet so health probes continue to work. |
 | `headscale_storage_size` | `1Gi` | Requested database/key volume capacity. |
 | `headscale_magic_dns_domain` | `tailnet.{{ domain }}` | Separate domain for device names. |
 | `headscale_dns_override_local` | `false` | Preserve clients' existing DNS resolvers. |
@@ -119,6 +121,19 @@ ansible-vault edit inventory/group_vars/all/vault.yml
 ```yaml
 headplane_cookie_secret: "<paste-the-32-character-value>"
 ```
+
+Create an expiring Headscale API key and use it to sign in at
+`https://headscale.compvirt.com/admin/`:
+
+```bash
+kubectl exec -n headscale deployment/headscale -c headscale -- headscale apikeys create --expiration 90d
+```
+
+The API key is shown only once and grants full Headplane access. Keep it
+private and expire or replace it when needed. The Headplane session cookie
+secret remains in Vault. LAN-restricting `/api/v1/` means remote use of the
+Headscale management CLI is blocked; standard Tailscale device traffic
+continues through the public root endpoint.
 
 Run the playbook from the current `ansible/` directory:
 

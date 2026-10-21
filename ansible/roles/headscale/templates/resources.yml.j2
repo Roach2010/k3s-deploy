@@ -114,15 +114,14 @@ spec:
             - name: https
               containerPort: 8443
           readinessProbe:
+            # Probe Headscale directly so this readiness check follows the
+            # application health without exposing the LAN-only /healthz URL.
             httpGet:
-              scheme: HTTPS
-              path: /healthz
-              port: https
+              path: /health
+              port: 8080
             periodSeconds: 5
           livenessProbe:
-            httpGet:
-              scheme: HTTPS
-              path: /healthz
+            tcpSocket:
               port: https
             initialDelaySeconds: 10
             periodSeconds: 10

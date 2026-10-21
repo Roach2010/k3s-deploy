@@ -13,6 +13,12 @@ http {
         default upgrade;
         '' close;
     }
+    geo $headscale_lan_client {
+        default 0;
+{% for cidr in headscale_lan_cidrs %}
+        {{ cidr }} 1;
+{% endfor %}
+    }
     server {
         listen 8443 ssl;
         server_name {{ headscale_hostname }};
@@ -20,9 +26,17 @@ http {
         ssl_certificate_key /tls/tls.key;
         ssl_protocols TLSv1.2 TLSv1.3;
         client_max_body_size 0;
-        location = /healthz { return 200 'ok'; }
-        location = /admin { return 308 /admin/; }
+        # Keep proxy health checks available to the cluster LAN only.
+        location = /healthz {
+            if ($headscale_lan_client = 0) { return 404; }
+            return 200 'ok';
+        }
+        location = /admin {
+            if ($headscale_lan_client = 0) { return 404; }
+            return 308 https://{{ headscale_hostname }}/admin/;
+        }
         location ^~ /admin/ {
+            if ($headscale_lan_client = 0) { return 404; }
             proxy_pass http://127.0.0.1:3000;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -33,9 +47,31 @@ http {
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header X-Forwarded-Host $host;
             proxy_set_header X-Forwarded-Port 443;
-            proxy_redirect http:// https://;
             proxy_redirect ~^https?://([^/:]+):8443(/.*)$ https://$1$2;
+            proxy_redirect http:// https://;
             proxy_buffering off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+        location ^~ /healthz/ {
+            if ($headscale_lan_client = 0) { return 404; }
+            return 404;
+        }
+        # Restrict management and diagnostic endpoints while leaving the
+        # Headscale client control protocol in the public catch-all below.
+        location ~ ^/(?:api/v1(?:/|$)|health(?:/|$)|version(?:/|$)) {
+            if ($headscale_lan_client = 0) { return 404; }
+            proxy_pass http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-Port 443;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_buffering off;
+            proxy_request_buffering off;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
         }

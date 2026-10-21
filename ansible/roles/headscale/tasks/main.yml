@@ -7,6 +7,7 @@
       - headplane_version | length > 0
       - headplane_version != 'latest'
       - headplane_cookie_secret | length == 32
+      - headscale_lan_cidrs | length > 0
       - headscale_storage_class | length > 0
       - headscale_service_ip | length > 0
       - headscale_hostname is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
