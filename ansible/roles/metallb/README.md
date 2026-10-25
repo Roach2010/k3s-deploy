@@ -1,9 +1,15 @@
 # MetalLB for Dedicated Application Addresses
 
 The cluster bootstrap installs MetalLB in layer-2 mode. Its controller and
-speakers manage only services with `loadBalancerClass: metallb.io/metallb`.
-K3s ServiceLB remains enabled for unclassified services such as Traefik.
-No changes to the API VIP or Butane templates are required.
+speakers manage services with `loadBalancerClass: metallb.io/metallb`.
+K3s ServiceLB must be disabled on every server because it does not honor the
+Kubernetes load-balancer class and would compete with MetalLB. New servers get
+the setting from `fcos-k3s-controlplane.bu`; existing servers need
+`disable: [servicelb]` in `/etc/rancher/k3s/config.yaml` and a rolling restart.
+Merge the setting into existing YAML on every control-plane node; do not add
+a duplicate `disable` key. Apply the setting to all servers before restarting
+any, then restart them one at a time and wait for each to become Ready. The
+kube-vip API address remains separate and unchanged.
 
 Run from `ansible/`:
 
@@ -12,14 +18,23 @@ ansible-playbook playbooks/bootstrap-cluster.yml --tags metallb
 kubectl get pods -n metallb-system -o wide
 ```
 
+After ServiceLB is disabled on an existing cluster, configure Traefik's
+reserved VIP with:
+
+```bash
+ansible-playbook playbooks/bootstrap-cluster.yml --tags traefik
+kubectl get service traefik -n kube-system -o wide
+```
+
 The chart version lives in `defaults/main.yml`. Helm waits for readiness;
 FRR and FRR-K8s are disabled because this role uses ARP rather than BGP.
 The namespace permits the privileged network speaker pods.
 
 Application roles create their address pools and advertisements after the
-controller is ready. Emby reserves `<emby-service-ip>/32` with automatic allocation
-disabled. Its Service uses `externalTrafficPolicy: Local`, so the IP is
-advertised by the worker with the ready Emby endpoint.
+controller is ready. Traefik reserves it's IP, while other
+applications reserve their own addresses with automatic allocation disabled.
+Services using `externalTrafficPolicy: Local` are announced from a node with a
+ready local endpoint.
 
 Reserve service IPs outside DHCP and do not configure them on host interfaces.
 Eligible nodes must share the address's layer-2 network. Permit ARP, service

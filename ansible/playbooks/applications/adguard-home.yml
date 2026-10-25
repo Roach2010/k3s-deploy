@@ -1,0 +1,12 @@
+---
+- name: Deploy AdGuard Home
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+
+  roles:
+    - adguard_home

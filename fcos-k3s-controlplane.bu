@@ -171,6 +171,7 @@ storage:
               --write-kubeconfig-mode=600 \
               --cluster-cidr=__CLUSTER_CIDR__ \
               --service-cidr=__SERVICE_CIDR__ \
+              --disable=servicelb \
               --token-file=/etc/rancher/k3s/token \
               __CP_EXTRA_FLAG__" \
             sh -

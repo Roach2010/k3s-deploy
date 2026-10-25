@@ -1,0 +1,76 @@
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: {{ adguard_home_name }}
+  namespace: {{ adguard_home_metallb_namespace | to_json }}
+spec:
+  addresses: [{{ (adguard_home_dns_service_ip ~ '/32') | to_json }}]
+  autoAssign: false
+  serviceAllocation:
+    namespaces: [{{ adguard_home_namespace | to_json }}]
+    serviceSelectors:
+      - matchLabels:
+          app: {{ adguard_home_name | to_json }}
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: {{ adguard_home_name }}
+  namespace: {{ adguard_home_metallb_namespace | to_json }}
+spec:
+  ipAddressPools: [{{ adguard_home_name | to_json }}]
+  nodeSelectors:
+    - matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: DoesNotExist
+        - key: node-role.kubernetes.io/master
+          operator: DoesNotExist
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: lan-only
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  ipAllowList:
+    sourceRange:
+{% for cidr in adguard_home_lan_cidrs %}
+      - {{ cidr | to_json }}
+{% endfor %}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ adguard_home_name }}-tls
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  secretName: {{ adguard_home_name }}-tls
+  dnsNames: [{{ adguard_home_hostname | to_json }}]
+  issuerRef:
+    name: {{ adguard_home_cluster_issuer | to_json }}
+    kind: ClusterIssuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ adguard_home_name }}
+  namespace: {{ adguard_home_namespace | to_json }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: {{ (adguard_home_namespace ~ '-lan-only@kubernetescrd') | to_json }}
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [{{ adguard_home_hostname | to_json }}]
+      secretName: {{ adguard_home_name }}-tls
+  rules:
+    - host: {{ adguard_home_hostname | to_json }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ adguard_home_name }}-web
+                port:
+                  name: http

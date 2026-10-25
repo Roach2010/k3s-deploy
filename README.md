@@ -8,7 +8,7 @@ If you already know your way around Linux (`systemctl`, `journalctl`, system net
 
 ## 1. Core Architecture & Concepts
 
-Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping. Once the nodes are ready, Ansible installs the cluster services: MetalLB, the Synology and NFS CSI drivers, cert-manager, the Cloudflare API token Secret, and Let's Encrypt ClusterIssuers. Separate application playbooks deploy workloads such as Emby after those services are ready.
+Before running scripts, it helps to understand what is happening under the hood. Kubernetes is a distributed system, and this repository automates the OS-level provisioning and node bootstrapping. Once the nodes are ready, Ansible installs the cluster services: MetalLB, the Synology and NFS CSI drivers, cert-manager, the Cloudflare API token Secret, and Let's Encrypt ClusterIssuers. Separate application playbooks deploy workloads such as AdGuard Home, Emby, and Headscale after those services are ready.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -250,8 +250,9 @@ K3s applies it automatically; kube-vip runs only on control-plane nodes.
 One elected node owns `192.168.60.10`. If it fails, another advertises the
 same IP. Existing connections may need to reconnect during election.
 This provides automatic failover, without distributing API connections
-across all servers. Service load balancing is disabled in kube-vip;
-the existing K3s ServiceLB configuration is unchanged.
+across all servers. Service load balancing is disabled in kube-vip. K3s
+ServiceLB is disabled on all servers so MetalLB can own Kubernetes
+LoadBalancer Services without a second controller competing for them.
 
 Before deployment:
 
@@ -415,6 +416,31 @@ kubectl get nodes -o wide
 > **Why check `/home/core/.kube/config` instead of `/etc/rancher/k3s/k3s.yaml`?**
 > The system file at `/etc/rancher/k3s/k3s.yaml` is k3s's internal admin configuration. k3s automatically overwrites this file on every service restart to point to `127.0.0.1:6443`. To protect user settings, our deployment script creates a separate one-time copy in `/home/core/.kube/config` mapped to `KUBE_API_HOSTNAME`.
 
+### Configuring Traefik Ingress
+
+K3s installs Traefik as a bundled Helm chart. MetalLB advertises its existing
+LoadBalancer Service on the reserved VIP. The Service uses
+`externalTrafficPolicy: Local` to preserve client source IPs for LAN-only
+Ingress middleware. The K3s API continues to use kube-vip.
+K3s ServiceLB must be disabled on every server before MetalLB takes ownership.
+New control-plane nodes get this setting from the FCOS template. For the
+existing cluster, add `disable: [servicelb]` to
+`/etc/rancher/k3s/config.yaml` on every server and restart servers one at a
+time, waiting for each node to return Ready. Then run from `ansible/`:
+
+```bash
+ansible-playbook playbooks/bootstrap-cluster.yml --tags traefik
+kubectl get service traefik -n kube-system -o wide
+kubectl get ipaddresspool,l2advertisement -n metallb-system
+```
+
+Set `traefik_service_ip` in encrypted
+`ansible/inventory/group_vars/all/vault.yml`. The role creates a dedicated
+`/32` pool for this address and recreates the Traefik Service once to set its
+immutable MetalLB load-balancer class. Point LAN DNS records for Ingress
+hostnames to it's IP. Keep this address reserved outside DHCP and do
+not assign it to a node.
+
 ### Setting Up NFS Storage (`csi-driver-nfs`)
 
 The Ansible `nfs_csi` role installs
@@ -446,8 +472,8 @@ to your credentials file. Its default is `~/.kube/config`; exporting
 Run the playbook from `ansible/` so its configuration, inventory, and role
 paths are used.
 
-Bootstrap runs `metallb`, `synology_csi`, `nfs_csi`, `cert_manager`,
-`cloudflare`, and `cluster_issuer` in that order. The NFS role uses `kubernetes.core.k8s` with `apply: true`,
+Bootstrap runs `metallb`, `traefik`, `synology_csi`, `nfs_csi`,
+`cert_manager`, `cloudflare`, and `cluster_issuer` in that order. The NFS role uses `kubernetes.core.k8s` with `apply: true`,
 so repeated runs reconcile the same objects. It waits up to 300 seconds each
 for the controller Deployment and node DaemonSet, then checks the driver
 registration. Failed applies or readiness timeouts stop the playbook.
@@ -590,6 +616,40 @@ another node. Keep backups of application data outside the Synology volume.
 
 ---
 
+### Deploying AdGuard Home
+
+AdGuard Home is deployed separately from cluster bootstrap. Ansible creates a
+single-replica StatefulSet with configuration and working data on Synology
+iSCSI, a MetalLB LoadBalancer for DNS on TCP/UDP 53, and a Traefik Ingress for
+the HTTPS management UI. The Ingress is restricted to the configured LAN CIDRs.
+
+Reserve an unused LAN service IP outside DHCP for DNS and set
+`adguard_home_dns_service_ip` in the encrypted vault. This must be separate
+from the K3s API VIP, which kube-vip owns for the control plane. Configure local DNS for
+`adguard.<your-domain>` to Traefik's MetalLB VIP, `192.168.60.9`;
+do not point the web hostname at AdGuard's DNS service IP. After bootstrap has
+installed Synology CSI, MetalLB, cert-manager and Traefik, run
+from `ansible/`:
+
+```bash
+ansible-playbook playbooks/applications/adguard-home.yml
+```
+
+The first-run wizard listens on port 3000. Use `kubectl port-forward` to
+configure the admin account, upstream resolvers, and DNS listener at
+`0.0.0.0:53`; set the management web interface to `0.0.0.0:80` for the
+Traefik route. The role exposes both setup and management ports and probes
+either one during the first-run transition.
+Then configure router DHCP to give clients the AdGuard DNS service IP. Do not
+forward DNS port 53 from the Internet. The role retains the Synology PV and
+prints its name to pin in `inventory/group_vars/all/vars.yml` so it can be
+reattached if the claim is deleted.
+
+See the [AdGuard Home role guide](ansible/roles/adguard_home/README.md) for
+first-run setup, networking, storage retention, verification, and maintenance.
+
+---
+
 ### Deploying Emby
 
 Emby is deployed separately from cluster bootstrap as a single-replica
@@ -620,9 +680,11 @@ Point LAN DNS for `emby.<your-domain>` at that address. All eligible workers
 must share its layer-2 network, allow TCP 443 from clients, and allow TCP/UDP
 7946 between MetalLB speakers. Use at least two workers to support movement.
 
-MetalLB uses the explicit `metallb.io/metallb` load-balancer class. K3s
-ServiceLB continues managing unclassified services such as shared Traefik;
-Emby's traffic uses its dedicated service. No Butane changes are needed.
+MetalLB uses the explicit `metallb.io/metallb` load-balancer class for
+application Services. K3s ServiceLB is disabled so MetalLB exclusively
+manages LoadBalancer Services, including Traefik. New FCOS control-plane
+deployments include this setting; existing servers must be updated in their
+K3s config and restarted one at a time.
 See the [MetalLB role guide](ansible/roles/metallb/README.md) for network
 requirements. On an already bootstrapped cluster, install MetalLB from `ansible/`:
 
@@ -694,10 +756,11 @@ production certificate, one Headscale replica and a persistent SQLite database.
 
 The data claim uses the `synology-iscsi-storage` class, matching Emby's config
 volume. The role retains the PV and can reattach it after claim deletion. Set
-the reserved `headscale_service_ip` in the encrypted vault. The database and
-SQLite WAL files use iSCSI block storage, not the NFS media share. Configure
-public DNS and router TCP 443 forwarding to the Headscale service IP for
-`headscale.compvirt.com`, using Cloudflare **DNS only**.
+the reserved `headscale_service_ip` and a 32-character `headplane_cookie_secret`
+in the encrypted vault. The database and SQLite WAL files use iSCSI block
+storage, not the NFS media share. Configure public DNS and router TCP 443
+forwarding to the Headscale service IP for `headscale.compvirt.com`, using
+Cloudflare **DNS only**.
 
 From `ansible/`, after completing those prerequisites:
 
@@ -708,9 +771,18 @@ ansible-playbook playbooks/applications/headscale.yml
 NGINX terminates TLS in the Headscale pod and forwards to Headscale over the
 pod's loopback interface. MetalLB advertises the service IP from the worker
 hosting the ready pod, and `externalTrafficPolicy: Local` keeps client traffic
-on that worker. After the first successful deployment, pin the PV name printed
-by the role in `inventory/group_vars/all/vars.yml`; the role sets its reclaim
-policy to `Retain` and can reattach it after claim deletion. See the
+on that worker. Headplane serves its management UI at
+`https://headscale.compvirt.com/admin/` through the same TLS proxy. The admin
+UI, management API and status endpoints are restricted to the configured LAN
+CIDRs. The root Headscale control endpoint remains internet-reachable for
+remote devices. Headplane sign-in uses an expiring Headscale API key, which
+grants full UI access and must be kept private. The UI manages API-backed
+users, devices and pre-auth keys, while Ansible remains the source of truth
+for Headscale configuration and policy.
+
+After the first successful deployment, pin the PV name printed by the role in
+`inventory/group_vars/all/vars.yml`; the role sets its reclaim policy to
+`Retain` and can reattach it after claim deletion. See the
 [Headscale role guide](ansible/roles/headscale/README.md) for storage
 requirements, DNS, client registration, verification, and backup instructions.
 

@@ -1,0 +1,174 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ adguard_home_name }}-headless
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ adguard_home_name | to_json }}
+  ports:
+    - name: web
+      port: {{ adguard_home_web_port }}
+      targetPort: web
+      protocol: TCP
+    - name: setup
+      port: {{ adguard_home_setup_port }}
+      targetPort: setup
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ adguard_home_name }}-web
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ adguard_home_name | to_json }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: web
+      protocol: TCP
+    - name: setup
+      port: {{ adguard_home_setup_port }}
+      targetPort: setup
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ adguard_home_name }}-dns
+  namespace: {{ adguard_home_namespace | to_json }}
+  labels:
+    app: {{ adguard_home_name | to_json }}
+  annotations:
+    metallb.io/address-pool: {{ adguard_home_name | to_json }}
+    metallb.io/loadBalancerIPs: {{ adguard_home_dns_service_ip | to_json }}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: {{ adguard_home_load_balancer_class | to_json }}
+  externalTrafficPolicy: Local
+  selector:
+    app: {{ adguard_home_name | to_json }}
+  ports:
+    - name: dns-tcp
+      port: 53
+      targetPort: dns-tcp
+      protocol: TCP
+    - name: dns-udp
+      port: 53
+      targetPort: dns-udp
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ adguard_home_name }}
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  replicas: 1
+  serviceName: {{ adguard_home_name }}-headless
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: {{ adguard_home_name | to_json }}
+  template:
+    metadata:
+      labels:
+        app: {{ adguard_home_name | to_json }}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: node.kubernetes.io/exclude-from-external-load-balancers
+                    operator: DoesNotExist
+      automountServiceAccountToken: false
+      securityContext:
+        # AdGuard Home requires administrator rights for its first-run check.
+        # Keep the process running as root but remove every capability except
+        # binding DNS port 53.
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: adguard-home
+          image: {{ (adguard_home_image ~ ':' ~ adguard_home_version) | to_json }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+          ports:
+            - name: web
+              containerPort: {{ adguard_home_web_port }}
+              protocol: TCP
+            - name: setup
+              containerPort: {{ adguard_home_setup_port }}
+              protocol: TCP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - >-
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_setup_port }}/ ||
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_web_port }}/
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - >-
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_setup_port }}/ ||
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_web_port }}/
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - >-
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_setup_port }}/ ||
+                  wget -q -T 2 -O /dev/null http://127.0.0.1:{{ adguard_home_web_port }}/
+            periodSeconds: 20
+          resources: {{ adguard_home_resources | to_json }}
+          volumeMounts:
+            - name: data
+              mountPath: /opt/adguardhome/conf
+              subPath: conf
+            - name: data
+              mountPath: /opt/adguardhome/work
+              subPath: work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ (adguard_home_name ~ '-data') | to_json }}
+        - name: tmp
+          emptyDir: {}

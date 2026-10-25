@@ -1,0 +1,294 @@
+---
+- name: Validate AdGuard Home settings
+  ansible.builtin.assert:
+    that:
+      - adguard_home_version | length > 0
+      - adguard_home_version != 'latest'
+      - adguard_home_dns_service_ip | length > 0
+      - adguard_home_storage_class | length > 0
+      - adguard_home_lan_cidrs | length > 0
+      - adguard_home_hostname is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+    fail_msg: >-
+      Set a pinned AdGuard Home version, an unused DNS service IP, the Synology
+      iSCSI StorageClass, and the hostname.
+
+- name: Inspect eligible AdGuard Home workers
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Node
+    label_selectors:
+      - "!node-role.kubernetes.io/control-plane"
+      - "!node-role.kubernetes.io/master"
+      - "!node.kubernetes.io/exclude-from-external-load-balancers"
+  register: adguard_home_workers
+
+- name: Require at least one eligible worker
+  ansible.builtin.assert:
+    that:
+      - adguard_home_workers.resources | length > 0
+    fail_msg: AdGuard Home needs an eligible worker to advertise its DNS service IP.
+
+- name: Inspect MetalLB installation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ adguard_home_metallb_namespace }}"
+    name: metallb-controller
+  register: adguard_home_metallb
+
+- name: Require MetalLB cluster bootstrap
+  ansible.builtin.assert:
+    that:
+      - adguard_home_metallb.resources | length == 1
+    fail_msg: Run playbooks/bootstrap-cluster.yml --tags metallb before deploying AdGuard Home.
+
+- name: Inspect Traefik IngressClass
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: networking.k8s.io/v1
+    kind: IngressClass
+    name: traefik
+  register: adguard_home_ingress_class
+
+- name: Require the Traefik IngressClass
+  ansible.builtin.assert:
+    that:
+      - adguard_home_ingress_class.resources | length == 1
+    fail_msg: The Traefik IngressClass is missing; enable K3s Traefik before deploying AdGuard Home.
+
+- name: Inspect Traefik Middleware CRD
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: middlewares.traefik.io
+  register: adguard_home_middleware_crd
+
+- name: Require the Traefik Middleware CRD
+  ansible.builtin.assert:
+    that:
+      - adguard_home_middleware_crd.resources | length == 1
+    fail_msg: Traefik's Middleware CRD is missing; run the K3s Traefik installation first.
+
+- name: Inspect AdGuard Home ClusterIssuer
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: cert-manager.io/v1
+    kind: ClusterIssuer
+    name: "{{ adguard_home_cluster_issuer }}"
+  register: adguard_home_issuer
+
+- name: Require the AdGuard Home ClusterIssuer
+  ansible.builtin.assert:
+    that:
+      - adguard_home_issuer.resources | length == 1
+    fail_msg: Run cert-manager and ClusterIssuer bootstrap before deploying AdGuard Home.
+
+- name: Prepare AdGuard Home storage
+  tags: [adguard_home_storage]
+  block:
+    - name: Inspect AdGuard Home data StorageClass
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ adguard_home_storage_class }}"
+      register: adguard_home_storage
+
+    - name: Require Synology iSCSI storage
+      ansible.builtin.assert:
+        that:
+          - adguard_home_storage.resources | length == 1
+          - adguard_home_storage.resources[0].provisioner == 'csi.san.synology.com'
+          - adguard_home_storage.resources[0].parameters.protocol | default('iscsi') == 'iscsi'
+        fail_msg: Run Synology CSI cluster bootstrap before preparing AdGuard Home storage.
+
+    - name: Create AdGuard Home namespace
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ adguard_home_namespace }}"
+
+    - name: Inspect the existing AdGuard Home data claim
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ adguard_home_namespace }}"
+        name: "{{ adguard_home_name }}-data"
+      register: adguard_home_existing_claim
+
+    - name: Inspect the pinned AdGuard Home data volume
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ adguard_home_data_pv }}"
+      register: adguard_home_pinned_volume
+      when: adguard_home_data_pv | length > 0
+
+    - name: Require the pinned AdGuard Home data volume to exist
+      ansible.builtin.assert:
+        that:
+          - adguard_home_pinned_volume.resources | length == 1
+        fail_msg: >-
+          The pinned volume {{ adguard_home_data_pv }} does not exist. Check
+          adguard_home_data_pv; the role will not silently provision a replacement
+          for AdGuard Home data.
+      when: adguard_home_data_pv | length > 0
+
+    - name: Validate the pinned AdGuard Home data volume
+      vars:
+        adguard_home_pinned_claim_ref: "{{ adguard_home_pinned_volume.resources[0].spec.claimRef | default({}, true) }}"
+      ansible.builtin.assert:
+        that:
+          - adguard_home_pinned_volume.resources[0].spec.storageClassName == adguard_home_storage_class
+          - adguard_home_pinned_claim_ref.name | default(adguard_home_name ~ '-data') == adguard_home_name ~ '-data'
+          - adguard_home_pinned_claim_ref.namespace | default(adguard_home_namespace) == adguard_home_namespace
+        fail_msg: >-
+          The pinned volume {{ adguard_home_data_pv }} uses a different storage
+          class or is reserved for another claim. Check adguard_home_data_pv.
+      when: adguard_home_data_pv | length > 0
+
+    - name: Ensure the pin matches the currently bound AdGuard Home claim
+      ansible.builtin.assert:
+        that:
+          - adguard_home_existing_claim.resources[0].spec.volumeName == adguard_home_data_pv
+        fail_msg: >-
+          The existing AdGuard Home claim is bound to
+          {{ adguard_home_existing_claim.resources[0].spec.volumeName }}, not
+          {{ adguard_home_data_pv }}. Keep the existing PV pin or resolve the
+          claim before changing it.
+      when:
+        - adguard_home_data_pv | length > 0
+        - adguard_home_existing_claim.resources | length == 1
+        - adguard_home_existing_claim.resources[0].spec.volumeName | default('') | length > 0
+
+    - name: Reattach a released AdGuard Home data volume
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ adguard_home_data_pv }}"
+        patch:
+          - op: add
+            path: /spec/claimRef
+            value:
+              namespace: "{{ adguard_home_namespace }}"
+              name: "{{ adguard_home_name }}-data"
+      when:
+        - adguard_home_data_pv | length > 0
+        - adguard_home_pinned_volume.resources | length == 1
+        - adguard_home_pinned_volume.resources[0].status.phase | default('') == 'Released'
+
+    - name: Create AdGuard Home data claim
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        apply: true
+        template: data-pvc.yml.j2
+
+- name: Configure AdGuard Home DNS address, ingress and certificate
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'network.yml.j2') | from_yaml_all | list }}"
+
+- name: Wait for AdGuard Home certificate
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    namespace: "{{ adguard_home_namespace }}"
+    name: "{{ adguard_home_name }}-tls"
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ adguard_home_wait_timeout }}"
+  when: not ansible_check_mode
+
+- name: Apply AdGuard Home StatefulSet and Services
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'resources.yml.j2') | from_yaml_all | list }}"
+
+- name: Wait for the AdGuard Home data claim to bind
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ adguard_home_namespace }}"
+    name: "{{ adguard_home_name }}-data"
+  register: adguard_home_bound_claim
+  until:
+    - adguard_home_bound_claim.resources | length == 1
+    - adguard_home_bound_claim.resources[0].status.phase | default('') == 'Bound'
+  retries: "{{ ((adguard_home_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Keep the AdGuard Home data volume when its claim is deleted
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: "{{ adguard_home_bound_claim.resources[0].spec.volumeName }}"
+      spec:
+        persistentVolumeReclaimPolicy: Retain
+  when: not ansible_check_mode
+
+- name: Show the AdGuard Home data volume to pin
+  ansible.builtin.debug:
+    msg: >-
+      Pin your AdGuard Home data volume so redeploys can reattach it: set
+      adguard_home_data_pv to "{{ adguard_home_bound_claim.resources[0].spec.volumeName }}"
+      in inventory/group_vars/all/vars.yml.
+  when: not ansible_check_mode and adguard_home_data_pv | length == 0
+
+- name: Wait for the AdGuard Home StatefulSet revision
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: StatefulSet
+    namespace: "{{ adguard_home_namespace }}"
+    name: "{{ adguard_home_name }}"
+  register: adguard_home_statefulset
+  until:
+    - adguard_home_statefulset.resources | length == 1
+    - adguard_home_statefulset.resources[0].status.observedGeneration | default(0) | int >= adguard_home_statefulset.resources[0].metadata.generation | int
+    - adguard_home_statefulset.resources[0].status.readyReplicas | default(0) | int == 1
+    - adguard_home_statefulset.resources[0].status.updatedReplicas | default(0) | int == 1
+    - adguard_home_statefulset.resources[0].status.currentRevision | default('') | length > 0
+    - adguard_home_statefulset.resources[0].status.currentRevision | default('') == adguard_home_statefulset.resources[0].status.updateRevision | default('')
+  retries: "{{ ((adguard_home_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Wait for AdGuard Home DNS service IP allocation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Service
+    name: "{{ adguard_home_name }}-dns"
+    namespace: "{{ adguard_home_namespace }}"
+  register: adguard_home_dns_service
+  until:
+    - adguard_home_dns_service.resources | length == 1
+    - adguard_home_dns_service_ip in (adguard_home_dns_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip') | list)
+  retries: "{{ ((adguard_home_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode

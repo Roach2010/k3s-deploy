@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ adguard_home_name }}-data
+  namespace: {{ adguard_home_namespace | to_json }}
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: {{ adguard_home_storage_class | to_json }}
+{% if adguard_home_data_pv | length > 0 %}
+  volumeName: {{ adguard_home_data_pv | to_json }}
+{% endif %}
+  resources:
+    requests:
+      storage: {{ adguard_home_storage_size | to_json }}

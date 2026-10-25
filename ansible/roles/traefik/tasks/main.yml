@@ -1,0 +1,113 @@
+- name: Require the Traefik service VIP from Ansible Vault
+  ansible.builtin.assert:
+    that:
+      - traefik_service_ip | default('') | length > 0
+    fail_msg: Set traefik_service_ip in inventory/group_vars/all/vault.yml.
+
+- name: Inspect the K3s Traefik HelmChart
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: helm.cattle.io/v1
+    kind: HelmChart
+    namespace: "{{ traefik_namespace }}"
+    name: traefik
+  register: traefik_helm_chart
+
+- name: Require the K3s-managed Traefik HelmChart
+  ansible.builtin.assert:
+    that:
+      - traefik_helm_chart.resources | length == 1
+    fail_msg: The K3s Traefik HelmChart was not found in {{ traefik_namespace }}.
+
+- name: Inspect the existing Traefik Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Service
+    namespace: "{{ traefik_namespace }}"
+    name: traefik
+  register: traefik_existing_service
+
+- name: Inspect the MetalLB controller
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ traefik_metallb_namespace }}"
+    name: metallb-controller
+  register: traefik_metallb
+
+- name: Require MetalLB cluster bootstrap
+  ansible.builtin.assert:
+    that:
+      - traefik_metallb.resources | length == 1
+    fail_msg: Run playbooks/bootstrap-cluster.yml --tags metallb before configuring the Traefik VIP.
+
+- name: Inspect K3s ServiceLB proxy DaemonSets
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    namespace: kube-system
+    label_selectors:
+      - svccontroller.k3s.cattle.io/svcname
+  register: traefik_servicelb_daemonsets
+
+- name: Require K3s ServiceLB to be disabled
+  ansible.builtin.assert:
+    that:
+      - traefik_servicelb_daemonsets.resources | length == 0
+    fail_msg: >-
+      Disable K3s ServiceLB on every K3s server and wait for existing svclb
+      DaemonSets to disappear before assigning the Traefik Service to MetalLB.
+
+- name: Create the Traefik MetalLB address pool and advertisement
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'network.yml.j2') | from_yaml_all | list }}"
+
+- name: Configure K3s Traefik to use its MetalLB VIP
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChartConfig
+      metadata:
+        name: traefik
+        namespace: "{{ traefik_namespace }}"
+      spec:
+        valuesContent: "{{ lookup('template', 'values.yml.j2') }}"
+
+# loadBalancerClass is immutable. Recreate the existing Service once so the
+# K3s Helm controller can install it with the requested MetalLB class.
+- name: Remove the existing Traefik Service so it can be recreated with its load-balancer class
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: absent
+    api_version: v1
+    kind: Service
+    namespace: "{{ traefik_namespace }}"
+    name: traefik
+  when:
+    - traefik_existing_service.resources | length == 1
+    - traefik_existing_service.resources[0].spec.loadBalancerClass | default('') != traefik_load_balancer_class
+
+- name: Wait for Traefik to receive the reserved MetalLB VIP
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Service
+    namespace: "{{ traefik_namespace }}"
+    name: traefik
+  register: traefik_service
+  until:
+    - traefik_service.resources | length == 1
+    - traefik_service.resources[0].spec.loadBalancerClass | default('') == traefik_load_balancer_class
+    - traefik_service_ip in (traefik_service.resources[0].status.loadBalancer.ingress | default([]) | map(attribute='ip') | list)
+  retries: "{{ ((traefik_wait_timeout | int) / 5) | round(0, 'ceil') | int }}"
+  delay: 5
+  when: not ansible_check_mode

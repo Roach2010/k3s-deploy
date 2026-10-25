@@ -1,0 +1,7 @@
+service:
+  annotations:
+    metallb.io/address-pool: traefik
+    metallb.io/loadBalancerIPs: {{ traefik_service_ip | to_json }}
+  spec:
+    externalTrafficPolicy: Local
+    loadBalancerClass: {{ traefik_load_balancer_class | to_json }}

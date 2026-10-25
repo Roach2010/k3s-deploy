@@ -1,0 +1,33 @@
+---
+adguard_home_namespace: adguard-home
+adguard_home_name: adguard-home
+adguard_home_version: "v0.107.79"
+adguard_home_image: adguard/adguardhome
+adguard_home_hostname: "adguard.{{ domain }}"
+adguard_home_cluster_issuer: letsencrypt-production
+
+# Reserve an unused address on the LAN where MetalLB advertises service IPs.
+# Store this value in inventory/group_vars/all/vault.yml.
+adguard_home_dns_service_ip: ""
+adguard_home_load_balancer_class: metallb.io/metallb
+adguard_home_metallb_namespace: metallb-system
+
+# AdGuard Home uses 3000/TCP for first-run setup and 80/TCP for its configured
+# management UI. Keep both available; probes accept either during the switch.
+adguard_home_setup_port: 3000
+adguard_home_web_port: 80
+adguard_home_lan_cidrs:
+  - 192.168.30.0/24
+
+# Store both configuration and working data on Synology iSCSI block storage.
+adguard_home_storage_class: synology-iscsi-storage
+adguard_home_storage_size: 5Gi
+adguard_home_data_pv: ""
+adguard_home_wait_timeout: 300
+
+adguard_home_resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

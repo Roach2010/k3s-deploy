@@ -1,0 +1,22 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: traefik
+  namespace: {{ traefik_metallb_namespace | to_json }}
+spec:
+  addresses: [{{ (traefik_service_ip ~ '/32') | to_json }}]
+  autoAssign: false
+  serviceAllocation:
+    namespaces: [{{ traefik_namespace | to_json }}]
+    serviceSelectors:
+      - matchLabels:
+          app.kubernetes.io/instance: traefik-kube-system
+          app.kubernetes.io/name: traefik
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: traefik
+  namespace: {{ traefik_metallb_namespace | to_json }}
+spec:
+  ipAddressPools: [traefik]

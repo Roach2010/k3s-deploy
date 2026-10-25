@@ -1,0 +1,4 @@
+traefik_namespace: kube-system
+traefik_wait_timeout: 300
+traefik_metallb_namespace: metallb-system
+traefik_load_balancer_class: metallb.io/metallb
